@@ -155,23 +155,18 @@
         </div>
         <div class="sp-body">
           <div class="field">
-            <label for="selProvider">服务供应商 <span class="label-sub">（多端管理）</span></label>
-            <div class="prov-row">
-              <select id="selProvider" class="prov-select" title="切换当前供应商"></select>
-              <button id="btnAddProvider" class="btn outline sm" title="新增供应商">＋新增</button>
-              <button id="btnDelProvider" class="btn outline sm danger-tx" title="删除当前供应商">🗑</button>
+            <label>服务供应商 <span class="label-sub">（点击切换，右侧可重命名/删除）</span></label>
+            <div id="providerList" class="provider-list"></div>
+            <div class="prov-add-row">
+              <select id="inpProviderPreset" class="prov-preset" title="选择预设模板后点新增">
+                <option value="">＋ 从预设新增…</option>
+              </select>
+              <button id="btnAddProvider" class="btn outlines sm" title="用所选预设新增供应商">新增</button>
             </div>
-            <div class="prov-row">
-              <select id="inpProviderPreset" class="prov-select" title="选择预设模板填充端点"></select>
-            </div>
-            <div class="prov-row">
-              <input id="inpProviderName" type="text" placeholder="供应商名称（如 商汤 / Google / Kimi）" spellcheck="false">
-              <button id="btnRenameProvider" class="btn outline sm" title="重命名当前供应商">重命名</button>
-            </div>
-            <div class="hint">每个供应商独立保存 Base URL、接口端点、API Key 池与模型列表；切换即生效，聊天自动跟随所属供应商。</div>
+            <div class="hint">每个供应商独立保存 Base URL、API Key 池与模型列表；切换即生效，聊天自动跟随所属供应商。</div>
           </div>
           <div class="field">
-            <label for="inpBaseUrl">API Base URL</label>
+            <label for="inpBaseUrl">API Base URL（当前供应商）</label>
             <input id="inpBaseUrl" type="text" spellcheck="false"
                    placeholder="https://token.sensenova.cn/v1">
           </div>

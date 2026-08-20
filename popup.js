@@ -1817,18 +1817,33 @@ function updateComposerMode() {
 }
 
 /* ---------------- 设置面板 ---------------- */
+/** 渲染供应商列表（每行可切换，右侧行内 重命名/删除） */
 function renderProviderSelect() {
-  const sel = $('#selProvider');
-  if (!sel) return;
-  sel.innerHTML = (settings.providers || []).map(p =>
-    `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`
-  ).join('');
+  const listEl = $('#providerList');
+  if (!listEl) return;
   const cur = curProvider();
-  if (cur) sel.value = cur.id;
+  if (!(settings.providers || []).length) {
+    listEl.innerHTML = '<div class="pv-empty">暂无供应商，从上方预设添加</div>';
+    return;
+  }
+  listEl.innerHTML = (settings.providers || []).map(p => {
+    const active = p.id === cur?.id;
+    const keyCount = (p.keys || []).filter(k => k.value).length;
+    const imgEnd = p.imageEndpoint ? '🎨' : '';
+    return `<div class="pv-item${active ? ' active' : ''}" data-pid="${escapeHtml(p.id)}">
+      <span class="pv-dot" title="${active ? '当前供应商' : '点击切换'}"></span>
+      <span class="pv-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</span>
+      <span class="pv-badges">${keyCount > 0 ? '<span class="pv-badge">🔑' + keyCount + '</span>' : ''}${imgEnd ? '<span class="pv-badge">🎨</span>' : ''}</span>
+      <span class="pv-ops">
+        <button class="pv-op pv-rename" data-pid="${escapeHtml(p.id)}" title="重命名">✎</button>
+        <button class="pv-op pv-del" data-pid="${escapeHtml(p.id)}" title="删除">🗑</button>
+      </span>
+    </div>`;
+  }).join('');
 }
 
-/** 切换到指定供应商：投影其配置 + 载入模型，刷新 UI */
-function switchProvider(id) {
+/** 切换供应商：投影配置 + 载入模型 + 刷新 UI + 明确反馈 */
+function switchProvider(id, opts = {}) {
   const p = (settings.providers || []).find(x => x.id === id);
   if (!p) return;
   projectProvider(p);
@@ -1840,19 +1855,58 @@ function switchProvider(id) {
   updateComposerMode();
   renderModelDropdown();
   renderKeyStatus();
+  // 打开设置面板时同步编辑区
+  if (!$('#settingsOverlay').classList.contains('hidden')) syncProviderEditor();
+  if (opts.toast !== false) toast('已切换供应商：' + p.name, 'success');
+}
+
+/** 设置打开时：把当前供应商配置填入编辑区 + 填充预设下拉 */
+function syncProviderEditor() {
+  $('#inpBaseUrl').value = settings.baseUrl;
+  $('#inpChatEndpoint').value = settings.chatEndpoint;
+  $('#inpImageEndpoint').value = settings.imageEndpoint;
+  $('#inpModelsEndpoint').value = settings.modelsEndpoint;
+  $('#inpKeys').value = settings.keys.map(k => k.value).join('\n');
+  const ps = $('#inpProviderPreset');
+  if (ps) {
+    ps.innerHTML = '<option value="">＋ 从预设新增…</option>' +
+      PROVIDER_PRESETS.map(x => `<option value="${escapeHtml(x.name)}">${escapeHtml(x.name)}</option>`).join('');
+    ps.value = '';
+  }
+}
+
+/** 行内重命名：该行名称变输入框 */
+function startRename(pid) {
+  const p = (settings.providers || []).find(x => x.id === pid);
+  if (!p) return;
+  const item = document.querySelector(`#providerList .pv-item[data-pid="${CSS.escape(pid)}"] .pv-name`);
+  if (!item) return;
+  const old = p.name;
+  const input = document.createElement('input');
+  input.className = 'pv-rename-input';
+  input.value = old;
+  input.maxLength = 30;
+  const commit = () => {
+    const name = input.value.trim().slice(0, 30);
+    if (!name) { input.remove(); item.textContent = old; return; }
+    p.name = name;
+    saveSettings();
+    renderProviderSelect();
+    toast('已重命名：' + name, 'success');
+  };
+  item.replaceWith(input);
+  input.focus();
+  input.select();
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') commit();
+    else if (e.key === 'Escape') { input.remove(); }
+  });
+  input.addEventListener('blur', commit);
 }
 
 function openSettings() {
   renderProviderSelect();
-  // 预设下拉
-  const ps = $('#inpProviderPreset');
-  if (ps) {
-    const curName = curProvider()?.name || '';
-    ps.innerHTML = '<option value="">＋ 新供应商预设…</option>' +
-      PROVIDER_PRESETS.map(x => `<option value="${escapeHtml(x.name)}">${escapeHtml(x.name)}</option>`).join('');
-    ps.value = '';
-  }
-  $('#inpProviderName').value = curProvider()?.name || '';
+  syncProviderEditor();
   $('#inpBaseUrl').value = settings.baseUrl;
   $('#inpChatEndpoint').value = settings.chatEndpoint;
   $('#inpImageEndpoint').value = settings.imageEndpoint;
@@ -2098,50 +2152,61 @@ function bindEvents() {
     await fetchModels();
   });
 
-  // ---- 多供应商管理 ----
-  $('#selProvider').addEventListener('change', (e) => {
-    applySettingsFromPanel();          // 保存当前供应商编辑内容
-    switchProvider(e.target.value);    // 再切换到目标供应商
+  // ---- 多供应商管理（列表交互：点击切换 / 行内重命名 / 删除） ----
+  $('#providerList').addEventListener('click', (e) => {
+    // 行内操作按钮优先
+    const delBtn = e.target.closest('.pv-del');
+    if (delBtn) return deleteProvider(delBtn.dataset.pid);
+    const rnBtn = e.target.closest('.pv-rename');
+    if (rnBtn) { startRename(rnBtn.dataset.pid); return; }
+    // 点击行本身 → 切换供应商
+    const item = e.target.closest('.pv-item');
+    if (item) {
+      const pid = item.dataset.pid;
+      if (pid === curProvider()?.id) return; // 已是当前，跳过高亮闪烁
+      applySettingsFromPanel();          // 先把当前供应商编辑内容写回
+      switchProvider(pid);               // 切换并刷新（含聊天窗口模型列表）
+    }
   });
-  $('#inpProviderPreset').addEventListener('change', (e) => {
-    const p = PROVIDER_PRESETS.find(x => x.name === e.target.value);
-    if (!p) return;
-    $('#inpProviderName').value = p.name === '自定义' ? '' : p.name;
-    $('#inpBaseUrl').value = p.baseUrl;
-    $('#inpChatEndpoint').value = p.chatEndpoint;
-    $('#inpImageEndpoint').value = p.imageEndpoint;
-    $('#inpModelsEndpoint').value = p.modelsEndpoint;
-    $('#inpKeys').value = '';
-  });
-  $('#btnAddProvider').addEventListener('click', async () => {
-    const name = $('#inpProviderName').value.trim().slice(0, 30) || '自定义';
-    const prov = makeProvider({ name, baseUrl: $('#inpBaseUrl').value.trim(), chatEndpoint: $('#inpChatEndpoint').value, imageEndpoint: $('#inpImageEndpoint').value, modelsEndpoint: $('#inpModelsEndpoint').value });
-    settings.providers.push(prov);
-    projectProvider(prov);             // 直接切到新供应商（继承预设端点）
-    await saveSettings();
-    renderProviderSelect(); openSettings(); // 刷新面板编辑区
-    toast('已新增供应商：' + name + '，请填写 API Key', 'success');
-  });
-  $('#btnRenameProvider').addEventListener('click', async () => {
-    const p = curProvider(); if (!p) return;
-    const name = $('#inpProviderName').value.trim().slice(0, 30);
-    if (!name) { toast('供应商名称不能为空', 'error'); return; }
-    p.name = name;
-    await saveSettings();
-    renderProviderSelect();
-    toast('已重命名', 'success');
-  });
-  $('#btnDelProvider').addEventListener('click', async () => {
-    const p = curProvider();
+
+  function deleteProvider(pid) {
+    const p = (settings.providers || []).find(x => x.id === pid);
     if (!p) return;
     if (settings.providers.length <= 1) { toast('至少需保留一个供应商', 'error'); return; }
     if (!confirm('确认删除供应商「' + p.name + '」？其 Key、模型列表与设置将一并删除，无法恢复。')) return;
-    settings.providers = settings.providers.filter(x => x.id !== p.id);
+    settings.providers = settings.providers.filter(x => x.id !== pid);
     settings.currentProviderId = settings.providers[0].id;
     projectProvider(settings.providers[0]);
-    await saveSettings();
-    renderProviderSelect(); openSettings();
+    saveSettings();
+    renderProviderSelect(); syncProviderEditor();
+    // 刷新聊天窗口的模型列表与按钮
+    autoSelectModel(); updateModelButton(); updateComposerMode(); renderModelDropdown();
     toast('已删除供应商', 'success');
+  }
+
+  // 预设新增：读取当前面板填好的表单作为新供应商
+  $('#inpProviderPreset').addEventListener('change', (e) => {
+    const val = e.target.value;
+    const preset = PROVIDER_PRESETS.find(x => x.name === val) || null;
+    // 记住选中预设名，点「新增」时按此创建
+    e.target.dataset.pick = preset ? preset.name : '';
+  });
+  $('#btnAddProvider').addEventListener('click', async () => {
+    const ps = $('#inpProviderPreset');
+    const pickName = ps.dataset.pick || ps.value || '自定义';
+    const preset = PROVIDER_PRESETS.find(x => x.name === pickName) || {};
+    const prov = makeProvider({
+      name: preset.name === '自定义' ? '自定义' : preset.name,
+      baseUrl: preset.baseUrl || '',
+      chatEndpoint: preset.chatEndpoint,
+      imageEndpoint: preset.imageEndpoint,
+      modelsEndpoint: preset.modelsEndpoint
+    });
+    settings.providers.push(prov);
+    projectProvider(prov);             // 直接切到新供应商（继承预设端点）
+    await saveSettings();
+    renderProviderSelect(); syncProviderEditor();
+    toast('已新增供应商：' + prov.name + '，请填写 API Key', 'success');
   });
 
   // 清空当前聊天（两步确认，避免误触；其他会话不受影响）
