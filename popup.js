@@ -25,6 +25,9 @@ const DEFAULTS = {
   noStreamModels: {},               // { modelId: true } 已确认流式异常的模型，请求时自动用非流式
   inputHeight: 0,                   // 用户手动拖拽的输入框高度（跨会话记忆）
   lastModel: '',
+  providers: [],                    // [{id, name, baseUrl, chatEndpoint, imageEndpoint, modelsEndpoint,
+                                    //   keys, modelTypeOverrides, noStreamModels, cachedModels, imageConfig, lastModel}]
+  currentProviderId: '',            // 当前活动供应商
   memory: {                         // 三层记忆系统配置
     recentRounds: 8,                // 近期原文保留轮数（5-10）
     summaryEnabled: true,           // 滚动综述开关
@@ -35,6 +38,16 @@ const DEFAULTS = {
     embeddingMode: ''               // ''=未探测 / 'api' / 'local'（本地词法嵌入）
   }
 };
+
+/* 常见供应商预设模板（新增强可按需选用，避免手填） */
+const PROVIDER_PRESETS = [
+  { name: '商汤 SenseNova', baseUrl: 'https://token.sensenova.cn/v1', chatEndpoint: '/chat/completions', imageEndpoint: '/images/generations', modelsEndpoint: '/models' },
+  { name: 'Google Gemini (OpenAI 兼容)', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' },
+  { name: 'Kimi (Moonshot)', baseUrl: 'https://api.moonshot.cn/v1', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' },
+  { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' },
+  { name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', chatEndpoint: '/chat/completions', imageEndpoint: '/images/generations', modelsEndpoint: '/models' },
+  { name: '自定义', baseUrl: '', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' }
+];
 
 /* 商汤 U1 绘图模型支持的合法尺寸（来自 API 400 报错白名单，2K 分辨率 11 种比例 + 2 种全景） */
 const VALID_IMAGE_SIZES = [
@@ -162,6 +175,100 @@ function joinUrl(base, path) {
   return b + p;
 }
 
+/* ---------------- 多供应商（Provider）体系 ----------------
+ * 顶层 settings.baseUrl / keys / modelTypeOverrides / noStreamModels / lastModel / imageConfig
+ * 一律视为「当前供应商」的活动投影，便于既有请求代码零改动。
+ * 实际持久化按供应商分别保存于 settings.providers[]。
+ */
+function curProvider() {
+  const list = settings.providers || [];
+  return list.find(p => p.id === settings.currentProviderId) || list[0] || null;
+}
+
+/** 新建一个供应商对象（id 全局唯一） */
+function makeProvider(preset = {}) {
+  const name = (preset.name || '自定义').trim();
+  const baseUrl = String(preset.baseUrl || '').trim().replace(/\/+$/, '');
+  return {
+    id: 'prov_' + uid(),
+    name,
+    baseUrl,
+    chatEndpoint: normEndpoint(preset.chatEndpoint, DEFAULTS.chatEndpoint),
+    imageEndpoint: normEndpoint(preset.imageEndpoint, DEFAULTS.imageEndpoint, true),
+    modelsEndpoint: normEndpoint(preset.modelsEndpoint, DEFAULTS.modelsEndpoint),
+    keys: [],
+    modelTypeOverrides: {},
+    noStreamModels: {},
+    cachedModels: [],
+    imageConfig: { ...JSON.parse(JSON.stringify(DEFAULTS.imageConfig)) },
+    lastModel: ''
+  };
+}
+
+function normEndpoint(v, def, allowEmpty) {
+  const s = String(v || '').trim();
+  if (!s) return allowEmpty ? '' : def;
+  return s.startsWith('/') ? s : '/' + s;
+}
+
+/** 规范化一个已持久化的供应商对象（兼容缺字段/旧结构） */
+function normalizeProvider(p, idx) {
+  const baseUrl = String(p.baseUrl || '').trim().replace(/\/+$/, '');
+  return {
+    id: p.id || 'prov_' + (idx + 1) + '_' + uid(),
+    name: (p.name || '供应商 ' + (idx + 1)).toString().slice(0, 30),
+    baseUrl,
+    chatEndpoint: normEndpoint(p.chatEndpoint, DEFAULTS.chatEndpoint),
+    imageEndpoint: normEndpoint(p.imageEndpoint, DEFAULTS.imageEndpoint, true),
+    modelsEndpoint: normEndpoint(p.modelsEndpoint, DEFAULTS.modelsEndpoint),
+    keys: (p.keys || []).map((k, i) => ({
+      id: k.id || 'key_' + i,
+      value: k.value || '',
+      status: k.status || 'active',
+      failCount: k.failCount || 0,
+      coolingUntil: k.coolingUntil || 0,
+      coolReason: k.coolReason || ''
+    })),
+    modelTypeOverrides: p.modelTypeOverrides || {},
+    noStreamModels: p.noStreamModels || {},
+    cachedModels: Array.isArray(p.cachedModels) ? p.cachedModels : [],
+    imageConfig: { ...DEFAULTS.imageConfig, ...(p.imageConfig || {}) },
+    lastModel: p.lastModel || ''
+  };
+}
+
+/** 把指定供应商的配置投影到顶层 settings + 载入其模型列表 */
+function projectProvider(p) {
+  if (!p) return;
+  settings.currentProviderId = p.id;
+  settings.baseUrl = p.baseUrl || '';
+  settings.chatEndpoint = p.chatEndpoint;
+  settings.imageEndpoint = p.imageEndpoint;
+  settings.modelsEndpoint = p.modelsEndpoint;
+  settings.keys = p.keys;
+  settings.modelTypeOverrides = p.modelTypeOverrides;
+  settings.noStreamModels = p.noStreamModels;
+  settings.lastModel = p.lastModel || '';
+  settings.imageConfig = p.imageConfig;
+  cachedModels = p.cachedModels || [];
+}
+
+/** 把顶层 settings 的活动值写回当前供应商（持久化前调用） */
+function absorbProvider() {
+  const p = curProvider();
+  if (!p) return;
+  p.baseUrl = settings.baseUrl;
+  p.chatEndpoint = settings.chatEndpoint;
+  p.imageEndpoint = settings.imageEndpoint;
+  p.modelsEndpoint = settings.modelsEndpoint;
+  p.keys = settings.keys;
+  p.modelTypeOverrides = settings.modelTypeOverrides;
+  p.noStreamModels = settings.noStreamModels;
+  p.lastModel = settings.lastModel || '';
+  p.imageConfig = settings.imageConfig;
+  p.cachedModels = cachedModels;
+}
+
 function isDataUrl(s) { return typeof s === 'string' && s.startsWith('data:image'); }
 
 function blobToBase64(blob) {
@@ -282,6 +389,31 @@ async function loadAll() {
   }));
   cachedModels = Array.isArray(data.cachedModels) ? data.cachedModels : [];
 
+  /* ---- 多供应商：迁移旧版单端配置 → 首个供应商 ---- */
+  if (!Array.isArray(settings.providers) || settings.providers.length === 0) {
+    // 旧版（无 providers）：把顶层 baseUrl/keys/模型缓存整体降级为第一个供应商
+    settings.providers = [normalizeProvider({
+      baseUrl: settings.baseUrl,
+      chatEndpoint: settings.chatEndpoint,
+      imageEndpoint: settings.imageEndpoint,
+      modelsEndpoint: settings.modelsEndpoint,
+      keys: settings.keys,
+      modelTypeOverrides: settings.modelTypeOverrides,
+      noStreamModels: settings.noStreamModels,
+      cachedModels,
+      imageConfig: settings.imageConfig,
+      lastModel: settings.lastModel
+    }, 0)];
+  } else {
+    // 已有多供应商：规范化每一项
+    settings.providers = settings.providers.map(normalizeProvider);
+  }
+  // 确保 currentProviderId 有效
+  const cur = settings.currentProviderId;
+  if (!settings.providers.some(p => p.id === cur)) settings.currentProviderId = settings.providers[0].id;
+  // 投影当前供应商到顶层（既有请求代码零改动地读取顶层配置）
+  projectProvider(curProvider());
+
   /* 会话数据加载（含旧版 history 单流自动迁移） */
   sessions = Array.isArray(data.sessions) ? data.sessions : [];
   trash = Array.isArray(data.trash) ? data.trash : [];
@@ -303,6 +435,7 @@ async function loadAll() {
 }
 
 async function saveSettings() {
+  absorbProvider(); // 顶层活动值 → 写回当前供应商，再整体持久化
   try { await chrome.storage.local.set({ settings }); }
   catch (e) { console.warn('保存设置失败', e); }
 }
@@ -328,6 +461,7 @@ function makeSessionObject(title, messages = []) {
   return {
     id: 'sess_' + uid(), title, createdAt: Date.now(), updatedAt: Date.now(), messages,
     model: '', draft: '',
+    providerId: settings.currentProviderId || curProvider()?.id || '', // 所属供应商
     category: '',                   // 分类收纳（空 = 未分类）
     summary: '',                    // 滚动综述（更早对话的要点）
     summarizedUpTo: 0               // 已综述的已完成文本消息数（幂等水位）
@@ -397,6 +531,12 @@ async function switchSession(id) {
   syncSessionDraft();                                   // 切走前保存当前输入草稿
   currentSessionId = id;
   chatHistory = curSession().messages;
+  // 会话归属的供应商 ≠ 当前 → 跟随切换（保证其模型列表可用）
+  const s = curSession();
+  if (s && s.providerId && s.providerId !== settings.currentProviderId &&
+      (settings.providers || []).some(p => p.id === s.providerId)) {
+    switchProvider(s.providerId);
+  }
   await persistHistory();
   renderAllMessages();
   renderSessionList();
@@ -604,7 +744,7 @@ async function fetchModels(auto = false) {
       .map(m => m.id || m.model || m.name)
       .filter(Boolean);
     cachedModels = [...new Set(list)].map(id => ({ id, type: classifyModel(id) }));
-    await chrome.storage.local.set({ cachedModels });
+    await saveSettings();               // 写回当前供应商并持久化
     renderModelDropdown();
     autoSelectModel();
     syncSessionModel();   // 模型列表刷新后，把生效模型写回当前会话
@@ -1199,6 +1339,9 @@ async function doImageGeneration(prompt, signal) {
   };
 
   try {
+    if (!settings.imageEndpoint) {
+      throw new Error('当前供应商「' + (curProvider()?.name || '') + '」没有绘图能力，请切换到支持绘图（如商汤）的供应商，或在该供应商设置中填写绘图端点。');
+    }
     const res = await requestWithRotation(joinUrl(settings.baseUrl, settings.imageEndpoint), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1674,7 +1817,42 @@ function updateComposerMode() {
 }
 
 /* ---------------- 设置面板 ---------------- */
+function renderProviderSelect() {
+  const sel = $('#selProvider');
+  if (!sel) return;
+  sel.innerHTML = (settings.providers || []).map(p =>
+    `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`
+  ).join('');
+  const cur = curProvider();
+  if (cur) sel.value = cur.id;
+}
+
+/** 切换到指定供应商：投影其配置 + 载入模型，刷新 UI */
+function switchProvider(id) {
+  const p = (settings.providers || []).find(x => x.id === id);
+  if (!p) return;
+  projectProvider(p);
+  saveSettings();
+  renderProviderSelect();
+  // 会话级模型跟随该供应商的模型列表
+  autoSelectModel();
+  updateModelButton();
+  updateComposerMode();
+  renderModelDropdown();
+  renderKeyStatus();
+}
+
 function openSettings() {
+  renderProviderSelect();
+  // 预设下拉
+  const ps = $('#inpProviderPreset');
+  if (ps) {
+    const curName = curProvider()?.name || '';
+    ps.innerHTML = '<option value="">＋ 新供应商预设…</option>' +
+      PROVIDER_PRESETS.map(x => `<option value="${escapeHtml(x.name)}">${escapeHtml(x.name)}</option>`).join('');
+    ps.value = '';
+  }
+  $('#inpProviderName').value = curProvider()?.name || '';
   $('#inpBaseUrl').value = settings.baseUrl;
   $('#inpChatEndpoint').value = settings.chatEndpoint;
   $('#inpImageEndpoint').value = settings.imageEndpoint;
@@ -1918,6 +2096,52 @@ function bindEvents() {
     applySettingsFromPanel();
     toast('配置已保存，正在拉取模型…');
     await fetchModels();
+  });
+
+  // ---- 多供应商管理 ----
+  $('#selProvider').addEventListener('change', (e) => {
+    applySettingsFromPanel();          // 保存当前供应商编辑内容
+    switchProvider(e.target.value);    // 再切换到目标供应商
+  });
+  $('#inpProviderPreset').addEventListener('change', (e) => {
+    const p = PROVIDER_PRESETS.find(x => x.name === e.target.value);
+    if (!p) return;
+    $('#inpProviderName').value = p.name === '自定义' ? '' : p.name;
+    $('#inpBaseUrl').value = p.baseUrl;
+    $('#inpChatEndpoint').value = p.chatEndpoint;
+    $('#inpImageEndpoint').value = p.imageEndpoint;
+    $('#inpModelsEndpoint').value = p.modelsEndpoint;
+    $('#inpKeys').value = '';
+  });
+  $('#btnAddProvider').addEventListener('click', async () => {
+    const name = $('#inpProviderName').value.trim().slice(0, 30) || '自定义';
+    const prov = makeProvider({ name, baseUrl: $('#inpBaseUrl').value.trim(), chatEndpoint: $('#inpChatEndpoint').value, imageEndpoint: $('#inpImageEndpoint').value, modelsEndpoint: $('#inpModelsEndpoint').value });
+    settings.providers.push(prov);
+    projectProvider(prov);             // 直接切到新供应商（继承预设端点）
+    await saveSettings();
+    renderProviderSelect(); openSettings(); // 刷新面板编辑区
+    toast('已新增供应商：' + name + '，请填写 API Key', 'success');
+  });
+  $('#btnRenameProvider').addEventListener('click', async () => {
+    const p = curProvider(); if (!p) return;
+    const name = $('#inpProviderName').value.trim().slice(0, 30);
+    if (!name) { toast('供应商名称不能为空', 'error'); return; }
+    p.name = name;
+    await saveSettings();
+    renderProviderSelect();
+    toast('已重命名', 'success');
+  });
+  $('#btnDelProvider').addEventListener('click', async () => {
+    const p = curProvider();
+    if (!p) return;
+    if (settings.providers.length <= 1) { toast('至少需保留一个供应商', 'error'); return; }
+    if (!confirm('确认删除供应商「' + p.name + '」？其 Key、模型列表与设置将一并删除，无法恢复。')) return;
+    settings.providers = settings.providers.filter(x => x.id !== p.id);
+    settings.currentProviderId = settings.providers[0].id;
+    projectProvider(settings.providers[0]);
+    await saveSettings();
+    renderProviderSelect(); openSettings();
+    toast('已删除供应商', 'success');
   });
 
   // 清空当前聊天（两步确认，避免误触；其他会话不受影响）

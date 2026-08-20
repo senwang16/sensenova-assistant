@@ -155,6 +155,22 @@
         </div>
         <div class="sp-body">
           <div class="field">
+            <label for="selProvider">服务供应商 <span class="label-sub">（多端管理）</span></label>
+            <div class="prov-row">
+              <select id="selProvider" class="prov-select" title="切换当前供应商"></select>
+              <button id="btnAddProvider" class="btn outline sm" title="新增供应商">＋新增</button>
+              <button id="btnDelProvider" class="btn outline sm danger-tx" title="删除当前供应商">🗑</button>
+            </div>
+            <div class="prov-row">
+              <select id="inpProviderPreset" class="prov-select" title="选择预设模板填充端点"></select>
+            </div>
+            <div class="prov-row">
+              <input id="inpProviderName" type="text" placeholder="供应商名称（如 商汤 / Google / Kimi）" spellcheck="false">
+              <button id="btnRenameProvider" class="btn outline sm" title="重命名当前供应商">重命名</button>
+            </div>
+            <div class="hint">每个供应商独立保存 Base URL、接口端点、API Key 池与模型列表；切换即生效，聊天自动跟随所属供应商。</div>
+          </div>
+          <div class="field">
             <label for="inpBaseUrl">API Base URL</label>
             <input id="inpBaseUrl" type="text" spellcheck="false"
                    placeholder="https://token.sensenova.cn/v1">

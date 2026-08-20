@@ -12,6 +12,15 @@
 - **401 失效检测**：失效 Key 自动标记，不干扰正常请求
 - **实时状态面板**：每个 Key 的可用性、冷却状态一目了然
 
+### 🌐 多供应商（多端）支持
+- **一站式接入多家大模型**：可同时配置商汤、Google Gemini、Kimi、DeepSeek、OpenAI 等任意 OpenAI 兼容网关
+- **预设模板**：新增强时一键填充已知供应商的 Base URL 与端点，避免手填
+- **按供应商隔离**：每个供应商独立保存 Base URL、API Key 池、模型列表、尺寸设置与选项，互不干扰
+- **快速切换**：顶栏设置面板下拉即可切换当前供应商，切换即生效
+- **会话自动跟随**：每个聊天自动记住所属供应商，切换聊天时自动切回对应端，模型列表随之变化
+- **绘图能力自动识别**：无绘图接口的供应商（如 Google/Kimi）会明确提示，而非报错
+- **无缝迁移**：旧版单端配置自动升级为第一个供应商，历史数据不丢失
+
 ### 🤖 智能模型路由
 - **自动发现**：通过 `/models` 接口拉取全部可用模型
 - **关键词分类**：按关键词自动区分文本模型（SenseChat / DeepSeek / GLM 等）与绘图模型（U1 系列等）
@@ -76,18 +85,29 @@
 
 ### 第一步：添加 API Key
 1. 打开扩展，进入 **设置**
-2. 在 **API Key 管理** 中粘贴你的商汤 API Key（支持添加多个）
-3. 点击 **获取模型列表**，扩展会自动拉取并分类所有可用模型
+2. 在 **服务供应商** 下拉中选择你要用的供应商（商汤 / Google / Kimi / DeepSeek / OpenAI，或新建自定义）
+3. 选择供应商后，在 **API Key 池** 中粘贴该供应商的 API Key（支持添加多个，自动轮换）
+4. 点击 **获取模型列表**，扩展会自动拉取并分类该供应商下所有可用模型
 
 ### 第二步：选择模型
-- **文本对话**：从模型选择器中选择 SenseChat / DeepSeek / GLM 等文本模型
-- **图片生成**：选择 U1 等绘图模型，发送提示词即可生成图片
+- **文本对话**：从模型选择器中选择当前供应商下的文本模型（如 SenseChat、Gemini、Moonshot 等）
+- **图片生成**：选择支持绘图的供应商（如商汤 U1），发送提示词即可生成图片
 
-### 默认网关
+### 多供应商使用提示
+- **新增供应商**：设置面板顶部选预设（或选"自定义"），填好名称与 Key 后即可
+- **切换供应商**：顶栏设置面板下拉直接切换，模型列表与 Key 状态随之更新
+- **会话关联**：每个聊天记住所属供应商，切换聊天自动切回对应端，无需手动换
+- **绘图注意**：仅支持 OpenAI 风格 `/images/generations` 的供应商可绘图（商汤/OpenAI）；Google、Kimi 等纯文本端不提供，选择绘图模型时会明确提示
+
+### 常用预设网关
 ```
-https://token.sensenova.cn/v1
+商汤    https://token.sensenova.cn/v1
+Google  https://generativelanguage.googleapis.com/v1beta/openai   （OpenAI 兼容）
+Kimi    https://api.moonshot.cn/v1
+DeepSeek https://api.deepseek.com/v1
+OpenAI  https://api.openai.com/v1
 ```
-兼容 OpenAI 接口规范（`/chat/completions`、`/images/generations`、`/models`、`/embeddings`），支持自定义修改为其他兼容网关。
+均兼容 OpenAI 接口规范（`/chat/completions`、`/images/generations`、`/models`），也支持手动填写任意自定义兼容网关。
 
 ## 🗂 项目结构
 
