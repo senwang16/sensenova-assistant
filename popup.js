@@ -102,8 +102,10 @@ const COOLDOWN_401_MS = 10 * 60 * 1000;       // 401 鉴权失败冷却 10min
 const BACKOFF_BASE_MS = 2000;                 // 指数退避基准 2s
 const MAX_BACKOFF_ROUNDS = 2;                 // 全 Key 限流时最多额外退避重试轮数
 const SINGLE_KEY_BACKOFF_MS = [5000, 15000, 30000]; // 单 Key 退避计划（RPM 限流窗口通常 60s，退避过快只会持续撞墙）
-const STREAM_IDLE_TIMEOUT_MS = 45000;         // 流式空闲超时：连续无数据超过该时长 → 自动转非流式
-const REQUEST_TOTAL_TIMEOUT_MS = 180000;      // 单次请求总超时（含非流式与退避等待），杜绝无限转圈
+// 流式超时两段式：慢模型思考期（首字节前）给足时间，输出开始后若长时间卡住才判死
+const STREAM_FIRST_BYTE_TIMEOUT_MS = 120000;  // 首字节超时：等待第一段数据（思考期）上限 120s，避免把慢模型误判为卡死
+const STREAM_STALL_TIMEOUT_MS = 60000;        // 输出中途卡住：已开始输出后再连续 60s 无新数据 → 视为卡死
+const REQUEST_TOTAL_TIMEOUT_MS = 300000;      // 单次请求总超时（含非流式与退避等待）300s/5min，杜绝无限转圈
 
 /* ---------------- 全局状态 ---------------- */
 let settings = JSON.parse(JSON.stringify(DEFAULTS));
@@ -799,9 +801,8 @@ function isKeyUsable(k) {
   return k.status !== 'invalid' && Date.now() >= (k.coolingUntil || 0);
 }
 
-/** Round-Robin：指针自动指向下一个可用 Key */
-function pickNextKey() {
-  const keys = settings.keys;
+/** Round-Robin：指针自动指向下一个可用 Key（keys 由调用方传入，杜绝跨供应商串 Key） */
+function pickNextKey(keys) {
   if (!keys.length) return null;
   for (let i = 0; i < keys.length; i++) {
     keyPointer = (keyPointer + 1) % keys.length;
@@ -834,29 +835,35 @@ async function readApiError(res) {
  * - 全部为 401 → 直接报错（等待无意义）
  */
 async function requestWithRotation(url, init, { onNotice, signal, userSignal } = {}) {
-  if (!settings.keys.length) {
+  // 关键：锁定发起请求时的 Key 快照。
+  // 多供应商场景下，生成中切换会话会跟随切换供应商（projectProvider 替换 settings.keys），
+  // 若每次重试实时读 settings.keys，会拿 B 供应商的 Key 打 A 供应商的 URL → 必然 401 →
+  // 误冷却无辜 Key，后续请求连环退避甚至超时（单供应商时代无此路径，故当时更稳）。
+  // Key 对象本身仍是共享引用，冷却/激活状态变更可正常持久化。
+  const keys = settings.keys.slice();
+  if (!keys.length) {
     const e = new Error('尚未配置 API Key，请点击右上角 ⚙️ 进入设置');
     e.needSettings = true;
     throw e;
   }
 
   // 单 Key 场景使用更长的退避计划（见函数头注释）
-  const single = settings.keys.length <= 1;
+  const single = keys.length <= 1;
   const backoffRounds = single ? SINGLE_KEY_BACKOFF_MS.length : MAX_BACKOFF_ROUNDS;
 
   for (let round = 0; round <= backoffRounds; round++) {
     if (round > 0) {
-      const has429 = settings.keys.some(k => k.coolReason === '429');
+      const has429 = keys.some(k => k.coolReason === '429');
       if (!has429) break; // 全部 401，等待无意义
       const wait = single ? SINGLE_KEY_BACKOFF_MS[round - 1] : BACKOFF_BASE_MS * Math.pow(2, round - 1);
       if (onNotice) onNotice(`⏳ 所有 Key 均被限流，${wait / 1000}s 后自动重试（第 ${round + 1} 轮）…`);
       await abortableSleep(wait, signal); // 等待期间也可随时停止
-      settings.keys.forEach(k => { if (k.coolReason === '429') { k.coolingUntil = 0; k.status = 'active'; } });
+      keys.forEach(k => { if (k.coolReason === '429') { k.coolingUntil = 0; k.status = 'active'; } });
     }
 
     // 每轮最多尝试 Key 总数次（单 Key 即：每轮试 1 次）
-    for (let attempt = 0; attempt < settings.keys.length; attempt++) {
-      const key = pickNextKey();
+    for (let attempt = 0; attempt < keys.length; attempt++) {
+      const key = pickNextKey(keys);
       if (!key) {
         // 唯一 Key 冷却中且本轮已到此处：跳出进入下一轮退避
         break;
@@ -887,7 +894,7 @@ async function requestWithRotation(url, init, { onNotice, signal, userSignal } =
         renderKeyStatus();
         saveSettings();
         if (onNotice) {
-          const base = settings.keys.length === 1
+          const base = keys.length === 1
             ? `⚠️ Key 返回 ${res.status}（${res.status === 429 ? '限流' : '鉴权失败'}），将自动退避重试`
             : `⚠️ ${key.id} 返回 ${res.status}（${res.status === 429 ? '限流' : '鉴权失败'}），已冷却并自动切换下一个 Key`;
           onNotice(base + (detail ? '：' + detail : '…')); // 透出服务端限流详情，便于定位
@@ -908,11 +915,11 @@ async function requestWithRotation(url, init, { onNotice, signal, userSignal } =
     }
   }
 
-  const has429 = settings.keys.some(k => k.coolReason === '429');
-  const has401 = settings.keys.some(k => k.coolReason === '401');
+  const has429 = keys.some(k => k.coolReason === '429');
+  const has401 = keys.some(k => k.coolReason === '401');
   let msg = '所有 Key 均不可用，请稍后再试';
   if (has429 && has401) msg = '所有 Key 均处于限流(429)/鉴权失败(401)状态，请检查 Key 或稍后再试';
-  else if (has429) msg = settings.keys.length === 1
+  else if (has429) msg = keys.length === 1
     ? '当前 Key 持续被限流(429)，已自动退避重试多次仍失败，请稍后再试或补充更多 Key'
     : '所有 Key 均被限流(429)，已按指数退避自动重试仍失败，请稍后再试';
   else if (has401) msg = '所有 Key 鉴权失败(401)，请检查 Key 是否正确或已过期';
@@ -1233,11 +1240,15 @@ async function renderStorageStats() {
 async function streamChat(model, messages, { onDelta, onNotice, onReasoning, signal, stream = true }) {
   // 中断守卫：用户停止 / 空闲超时 / 总超时 任一触发即断开连接
   const guard = new AbortController();
-  let idleTimedOut = false, totalTimedOut = false;
+  let idleTimedOut = false, totalTimedOut = false, idlePhase = 'first-byte';
+  let hasData = false; // 是否已收到过数据（用于区分"思考期"与"输出期"两段超时）
   let idleTimer = null;
   const resetIdle = () => {
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => { idleTimedOut = true; guard.abort(); }, STREAM_IDLE_TIMEOUT_MS);
+    // 首字节前给慢模型更长时间（STREAM_FIRST_BYTE_TIMEOUT_MS）；开始输出后走更短的卡死判定
+    idlePhase = hasData ? 'stall' : 'first-byte';
+    idleTimer = setTimeout(() => { idleTimedOut = true; guard.abort(); },
+      hasData ? STREAM_STALL_TIMEOUT_MS : STREAM_FIRST_BYTE_TIMEOUT_MS);
   };
   const totalTimer = setTimeout(() => { totalTimedOut = true; guard.abort(); }, REQUEST_TOTAL_TIMEOUT_MS);
   const combined = linkedAbortSignal(signal, guard.signal);
@@ -1272,6 +1283,7 @@ async function streamChat(model, messages, { onDelta, onNotice, onReasoning, sig
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      hasData = true; // 已收到数据（心跳/思考/正文均算），进入"输出期"走更短卡死判定
       resetIdle(); // 收到任何数据（含心跳/思考过程）即重置空闲计时
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split(/\r?\n/);
@@ -1299,7 +1311,12 @@ async function streamChat(model, messages, { onDelta, onNotice, onReasoning, sig
     return full || '（模型仅返回了思考过程，未输出正文，可尝试关闭流式或更换模型）';
   } catch (e) {
     if (signal?.aborted) throw abortError();          // 用户主动停止优先
-    if (idleTimedOut) { const err = new Error(`流式无响应（${STREAM_IDLE_TIMEOUT_MS / 1000}s 未收到任何数据）`); err.idleTimeout = true; throw err; }
+    if (idleTimedOut) {
+      const ms = idlePhase === 'stall' ? STREAM_STALL_TIMEOUT_MS : STREAM_FIRST_BYTE_TIMEOUT_MS;
+      const label = !stream ? '等待响应超时' : (idlePhase === 'stall' ? '流式输出中断' : '流式无响应');
+      const err = new Error(`${label}（${ms / 1000}s 未收到${idlePhase === 'stall' ? '新' : '任何'}数据）`);
+      err.idleTimeout = true; err.idlePhase = idlePhase; throw err;
+    }
     if (totalTimedOut) { const err = new Error(`请求总超时（${REQUEST_TOTAL_TIMEOUT_MS / 1000}s）`); err.totalTimeout = true; throw err; }
     throw e;
   } finally {
@@ -1542,7 +1559,7 @@ async function doChat(prompt, signal) {
     if (!isCur()) return;
     if (firstUsable()) { clearInterval(gTimer); return; } // 已有输出，交给 paint 展示
     const s = Math.floor((Date.now() - gStart) / 1000);
-    notice(`⏳ 模型思考中… 已等待 ${s}s（${wantStream?'流式':'非流式'}）。${s >= 25 ? '若超 60s 无输出可点停止后尝试切换流式/非流式。' : ''}`);
+    notice(`⏳ 模型思考中… 已等待 ${s}s（${wantStream?'流式':'非流式'}）。${s >= 60 ? '该模型思考较慢属正常，可继续等待（最长约 120s）或点停止后切换流式/非流式。' : s >= 30 ? '若为慢思考模型请耐心等待，前 120s 内不会误判超时。' : ''}`);
   }, 1000);
 
   try {
