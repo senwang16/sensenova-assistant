@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 打包产物
+*.zip
+*.crx
+*.pem
+
+# 日志
+*.log
+npm-debug.log*
+
+# Node（如后续引入构建工具）
+node_modules/

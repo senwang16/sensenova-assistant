@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "SenseNova Assistant",
+  "version": "1.0.0",
+  "description": "商汤大模型多账号智能助手：多 Key 轮换、429/401 无感重试、文本/绘图模型智能路由、图片本地转存永不过期。",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SenseNova Assistant",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["storage", "downloads", "unlimitedStorage"],
+  "host_permissions": ["https://*/*"]
+}

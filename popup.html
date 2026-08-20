@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SenseNova Assistant</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ===== 左侧常驻会话栏 ===== -->
+    <aside id="sidebar">
+      <!-- 主视图：会话列表 -->
+      <div id="sbMain">
+        <div class="sb-head">
+          <span class="sb-title" id="sbTitle">💬 聊天</span>
+          <button id="btnNewSession" class="sb-new" title="新建聊天">＋ 新建</button>
+        </div>
+        <div id="sessionList" class="sb-list"></div>
+        <div class="sb-foot">
+          <button id="btnTrash" class="sb-foot-btn" title="已删除的聊天">🗑 回收站</button>
+        </div>
+      </div>
+
+      <!-- 二级视图：回收站 -->
+      <div id="sbTrash" class="hidden">
+        <div class="sb-head">
+          <button id="btnTrashBack" class="sb-back" title="返回聊天列表">‹</button>
+          <span class="sb-title" id="sbTrashTitle">🗑 回收站</span>
+          <button id="btnEmptyTrash" class="sb-purge-all" title="清空回收站（彻底删除全部文字、图片与向量数据）">清空</button>
+        </div>
+        <div id="trashList" class="sb-list"></div>
+        <div class="sb-trash-tip">删除的聊天保留在此，可恢复或彻底清理（彻底清理将同时删除其中的文字、图片与向量数据）</div>
+      </div>
+    </aside>
+
+    <div id="mainCol">
+
+    <!-- ===== 顶栏 ===== -->
+    <header class="header">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">
+          <defs>
+            <linearGradient id="lgHeader" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#4f6ef7"/>
+              <stop offset="1" stop-color="#8c54f7"/>
+            </linearGradient>
+          </defs>
+          <rect x="1" y="1" width="30" height="30" rx="9" fill="url(#lgHeader)"/>
+          <text x="16" y="21.5" font-size="15" font-weight="700" fill="#fff" text-anchor="middle"
+                font-family="system-ui, sans-serif">S</text>
+        </svg>
+        <div class="brand-text">
+          <span class="brand-name">SenseNova Assistant</span>
+          <span class="brand-sub">多账号轮换 · 聊天 / 绘图</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btnSessions" class="icon-btn" title="收起 / 展开左侧聊天列表">☰</button>
+        <button id="btnTheme" class="icon-btn" title="切换深色 / 浅色主题">🌙</button>
+        <button id="btnFullscreen" class="icon-btn" title="在新标签页打开完整界面（空间更大）">⛶</button>
+        <button id="btnSettings" class="icon-btn" title="设置（Base URL / Key 池）">⚙️</button>
+      </div>
+    </header>
+
+    <!-- ===== 消息流 ===== -->
+    <main id="chatScroll">
+      <div id="messages"></div>
+
+      <!-- 空状态引导 -->
+      <div id="emptyState">
+        <svg viewBox="0 0 32 32" width="44" height="44" aria-hidden="true">
+          <defs>
+            <linearGradient id="lgEmpty" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#4f6ef7"/>
+              <stop offset="1" stop-color="#8c54f7"/>
+            </linearGradient>
+          </defs>
+          <rect x="1" y="1" width="30" height="30" rx="9" fill="url(#lgEmpty)"/>
+          <text x="16" y="21.5" font-size="15" font-weight="700" fill="#fff" text-anchor="middle"
+                font-family="system-ui, sans-serif">S</text>
+        </svg>
+        <h3>SenseNova Assistant</h3>
+        <p class="es-sub">多 Key 轮换 · 429 无感重试 · 聊天 / 绘图一体</p>
+        <ol class="es-steps">
+          <li>点击右上角 <b>⚙️</b> 填写 Base URL 与多个 API Key（每行一个）</li>
+          <li>点击 <b>⟳</b> 拉取模型列表，自动分类 💬 文本 / 🎨 绘图</li>
+          <li>选择模型，即可开始多轮对话或 AI 绘图</li>
+        </ol>
+        <p class="es-tip">🎨 绘图结果自动转存本地缓存，永不过期 · ⛶ 可在新标签页打开完整界面</p>
+      </div>
+    </main>
+
+    <!-- ===== 输入区 ===== -->
+    <footer class="composer">
+      <!-- 输入行：3 行起步，右下角可拖拽拉伸 -->
+      <div class="input-row">
+        <textarea id="input" rows="3" spellcheck="false"
+                  placeholder="输入消息，Enter 发送 / Shift+Enter 换行&#10;（拖右下角可调整输入框高度）"></textarea>
+        <button id="btnSend" class="send-btn" title="发送">➤</button>
+      </div>
+
+      <!-- 底部工具栏：模型选择 + 绘图参数，紧凑单行 -->
+      <div id="modelBar">
+        <button id="modelBtn" class="model-btn" title="选择模型">
+          <span id="modelBtnIcon" class="mb-icon">❔</span>
+          <span id="modelBtnName" class="mb-name">选择模型</span>
+          <span class="mb-caret">▾</span>
+        </button>
+        <button id="btnRefreshModels" class="icon-btn" title="刷新模型列表">⟳</button>
+
+        <!-- 绘图参数（仅绘图模型显示，挤在角落） -->
+        <div id="imageParamsRow" class="hidden">
+          <select id="selSize" title="生成分辨率（商汤 U1 支持的 2K 尺寸）">
+            <option value="2048x2048">2048×2048 · 1:1 方形</option>
+            <option value="2752x1536">2752×1536 · 16:9 横版</option>
+            <option value="1536x2752">1536×2752 · 9:16 竖版</option>
+            <option value="2496x1664">2496×1664 · 3:2 横版</option>
+            <option value="1664x2496">1664x2496 · 2:3 竖版</option>
+            <option value="2368x1760">2368×1760 · 4:3 横版</option>
+            <option value="1760x2368">1760×2368 · 3:4 竖版</option>
+            <option value="2272x1824">2272×1824 · 5:4 横版</option>
+            <option value="1824x2272">1824×2272 · 4:5 竖版</option>
+            <option value="3072x1376">3072×1376 · 21:9 超宽</option>
+            <option value="1344x3136">1344×3136 · 9:21 超长竖版</option>
+            <option value="2560x720">2560×720 · 32:9 全景横幅</option>
+            <option value="3072x864">3072×864 · 32:9 全景横幅</option>
+          </select>
+          <label class="switch" title="是否添加水印（默认关闭）">
+            <input type="checkbox" id="chkWatermark">
+            <span class="slider"></span>
+            <span class="sw-text">水印</span>
+          </label>
+        </div>
+
+        <!-- 自定义模型下拉框（向上弹出） -->
+        <div id="modelDropdown" class="model-dropdown hidden">
+          <div class="md-head">
+            <input id="mdFilter" type="text" placeholder="搜索模型…" spellcheck="false">
+            <span id="mdCount" class="md-count"></span>
+          </div>
+          <div id="modelList" class="md-list"></div>
+          <div class="md-tip">点击模型左侧图标可手动修正类型（💬 文本 / 🎨 绘图）</div>
+        </div>
+      </div>
+    </footer>
+
+    <!-- ===== 设置面板（滑出层） ===== -->
+    <div id="settingsOverlay" class="hidden">
+      <div class="settings-panel">
+        <div class="sp-head">
+          <h2>⚙️ 设置</h2>
+          <button id="btnCloseSettings" class="icon-btn" title="关闭">✕</button>
+        </div>
+        <div class="sp-body">
+          <div class="field">
+            <label for="inpBaseUrl">API Base URL</label>
+            <input id="inpBaseUrl" type="text" spellcheck="false"
+                   placeholder="https://token.sensenova.cn/v1">
+          </div>
+
+          <details class="adv">
+            <summary>高级：接口端点（OpenAI 兼容）</summary>
+            <div class="field">
+              <label for="inpChatEndpoint">Chat 对话端点</label>
+              <input id="inpChatEndpoint" type="text" spellcheck="false">
+            </div>
+            <div class="field">
+              <label for="inpImageEndpoint">绘图端点</label>
+              <input id="inpImageEndpoint" type="text" spellcheck="false">
+            </div>
+            <div class="field">
+              <label for="inpModelsEndpoint">模型列表端点</label>
+              <input id="inpModelsEndpoint" type="text" spellcheck="false">
+            </div>
+            <div class="field">
+              <label class="switch" title="流式模式下逐字输出；若某模型限流或无响应，会自动降级为非流式并记住">
+                <input type="checkbox" id="inpStream" checked>
+                <span class="slider"></span>
+                <span class="sw-text">流式输出（SSE 逐字显示）</span>
+              </label>
+              <div class="hint">关闭后所有文本模型使用非流式请求（最稳定，等同 curl 行为）；个别流式异常的模型会被自动标记并单独走非流式</div>
+            </div>
+          </details>
+
+          <div class="field">
+            <label for="inpKeys">API Key 池 <span class="label-sub">（每行一个，自动轮换 + 无感重试）</span></label>
+            <textarea id="inpKeys" rows="4" spellcheck="false"
+                      placeholder="粘贴你的 Key，每行一个&#10;可带或不带 Bearer 前缀"></textarea>
+            <div class="hint">自动 Round-Robin 轮换；遇 429 限流 / 401 鉴权失败自动切换下一个 Key 静默重试</div>
+          </div>
+
+          <div class="field">
+            <label>Key 池状态</label>
+            <div id="keyStatusList" class="key-status-list"></div>
+          </div>
+
+          <details class="adv">
+            <summary>🧠 记忆系统（三层记忆）</summary>
+            <div class="field">
+              <label for="selRecentRounds">近期原文保留轮数</label>
+              <select id="selRecentRounds">
+                <option value="5">5 轮</option>
+                <option value="6">6 轮</option>
+                <option value="7">7 轮</option>
+                <option value="8" selected>8 轮（默认）</option>
+                <option value="9">9 轮</option>
+                <option value="10">10 轮</option>
+              </select>
+              <div class="hint">更早的对话自动压缩为要点综述，主线不丢失</div>
+            </div>
+            <div class="field">
+              <label class="switch">
+                <input type="checkbox" id="chkSummary" checked>
+                <span class="slider"></span>
+                <span class="sw-text">滚动综述（后台自动生成）</span>
+              </label>
+            </div>
+            <div class="field">
+              <label for="taSummaryModels">综述模型链 <span class="label-sub">（一行一个，按优先级依次尝试）</span></label>
+              <textarea id="taSummaryModels" rows="2" spellcheck="false"
+                        placeholder="留空 = 自动（轻量模型优先）&#10;sensenova-6.8-flash-lite&#10;glm-5.2"></textarea>
+              <div class="hint">综述与查询改写共用此链：前一个模型失败/限流时自动切换下一个</div>
+            </div>
+            <div class="field">
+              <label class="switch">
+                <input type="checkbox" id="chkRetrieval" checked>
+                <span class="slider"></span>
+                <span class="sw-text">相关历史检索（跨会话向量召回）</span>
+              </label>
+            </div>
+            <div class="field">
+              <label for="selTopK">召回条数（Top-K）</label>
+              <select id="selTopK">
+                <option value="3">3 条</option>
+                <option value="4">4 条</option>
+                <option value="5">5 条</option>
+                <option value="6" selected>6 条（默认）</option>
+                <option value="8">8 条</option>
+                <option value="10">10 条</option>
+              </select>
+              <div class="hint">向量库为浏览器本地 IndexedDB；嵌入优先探测网关 /embeddings，不支持时自动使用本地词法嵌入（零下载）</div>
+            </div>
+            <div class="field">
+              <label class="switch">
+                <input type="checkbox" id="chkRewrite" checked>
+                <span class="slider"></span>
+                <span class="sw-text">查询改写（检索前消解"它/这个"等指代）</span>
+              </label>
+              <div class="hint">仅在问题含指代词时触发；每次多一次小模型调用，换取更准的召回</div>
+            </div>
+          </details>
+
+          <details class="adv">
+            <summary>🗄 存储管理</summary>
+            <div id="storageStats" class="storage-stats"></div>
+            <div class="sp-actions">
+              <button id="btnCleanTrashedVectors" class="btn outline">清理回收站向量</button>
+              <button id="btnRebuildVectors" class="btn outline">重建全部向量</button>
+            </div>
+            <div class="hint">彻底删除/清空聊天会自动清理其向量与综述；恢复聊天自动重建向量；存储占用为浏览器分配给本插件的总空间</div>
+          </details>
+
+          <div class="sp-actions">
+            <button id="btnSaveSettings" class="btn primary">保存配置</button>
+            <button id="btnSaveAndFetch" class="btn outline">保存并刷新模型</button>
+          </div>
+
+          <div class="danger-zone">
+            <button id="btnClearHistory" class="btn danger">🗑 清空当前聊天</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 大图预览 ===== -->
+    <div id="lightbox" class="hidden">
+      <button id="btnLightboxClose" class="lb-close" title="关闭 (Esc)">✕</button>
+      <img id="lightboxImg" alt="预览大图">
+      <div id="lbPrompt" class="lb-prompt"></div>
+      <button id="btnLightboxDownload" class="btn primary lb-dl">⬇ 下载图片</button>
+    </div>
+
+    <!-- ===== 轻提示 ===== -->
+    <div id="toast"></div>
+    </div><!-- /mainCol -->
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
