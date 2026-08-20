@@ -548,14 +548,21 @@ html.fullscreen #mainCol > .header .brand-sub { display: inline; }
 }
 .mi-check { flex: none; color: var(--accent); font-size: 12px; }
 
-/* 非流式模型标记 */
-.mi-tag {
+/* 非流式模型标记（可点击解除） */
+.mi-ns-toggle {
   flex: none;
   font-size: 9.5px;
   color: var(--warn);
   background: var(--warn-soft);
   padding: 1px 6px;
   border-radius: 6px;
+  cursor: pointer;
+  transition: filter .15s, color .15s;
+}
+.mi-ns-toggle:hover {
+  filter: brightness(1.1);
+  color: var(--warn);
+  text-decoration: underline;
 }
 
 .md-empty { padding: 18px 12px; text-align: center; color: var(--text-dim); font-size: 12px; }

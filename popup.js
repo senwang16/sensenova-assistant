@@ -1262,8 +1262,6 @@ async function streamChat(model, messages, { onDelta, onNotice, onReasoning, sig
       onDelta(content);
       return content;
     }
-
-    // SSE 流式解析：空闲超时保护（部分模型流式挂起不吐数据，这里强制兜底）
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '', full = '', reasoning = '';
@@ -1541,7 +1539,15 @@ async function doChat(prompt, signal) {
       saveSettings();
       notice(`⚠️ ${selectedModel} 流式模式异常（${e.message}），已自动切换非流式重试，之后该模型将直接使用非流式`);
       msg.content = ''; msg._reasoning = ''; // 重置上次的部分输出
-      full = await runOnce(false);
+      try {
+        full = await runOnce(false);
+      } catch (e2) {
+        // 非流式重试也失败（多为模型/网关本身不稳定或服务端挂起）：
+        // 解除非流式锁，避免模型被"永久卡死"在这条坏路径上
+        if (settings.noStreamModels[selectedModel]) { delete settings.noStreamModels[selectedModel]; saveSettings(); }
+        e2.lockReleased = true;
+        throw e2;
+      }
     }
 
     msg.content = full;
@@ -1571,7 +1577,10 @@ async function doChat(prompt, signal) {
     } else {
       const i = msgs.indexOf(msg); if (i > -1) msgs.splice(i, 1);
       if (isCur()) { const n = elOf(); if (n) n.remove(); }
-      pushError('请求失败：' + e.message, e.needSettings, msgs, sid);
+      const hint = e.lockReleased
+        ? `\n\n已解除该模型的非流式锁定。若该模型持续无响应，可能是模型或网关不稳定，请在模型列表点击「非流式 ↺」手动测试流式，或更换模型。`
+        : `\n\n若模型无响应，可点击右侧模型名下的「非流式 ↺」手动切换流式/非流式再试。`;
+      pushError('请求失败：' + e.message + hint, e.needSettings, msgs, sid);
     }
   }
   if (isCur()) scrollToBottom();
@@ -1780,7 +1789,7 @@ function renderModelDropdown() {
       <button class="type-toggle${ovr ? ' overridden' : ''}" data-id="${escapeHtml(m.id)}"
               title="点击切换类型（当前：${t === 'image' ? '🎨 绘图' : '💬 文本'}）">${t === 'image' ? '🎨' : '💬'}</button>
       <span class="mi-name" title="${escapeHtml(m.id)}">${escapeHtml(m.id)}</span>
-      ${settings.noStreamModels[m.id] ? '<span class="mi-tag" title="该模型流式异常，已自动使用非流式请求">非流式</span>' : ''}
+      ${settings.noStreamModels[m.id] ? '<button class="mi-ns-toggle" data-id="' + escapeHtml(m.id) + '" title="该模型被自动锁定为非流式。点击解除，恢复流式请求（若仍异常会再次自动降级）">非流式 ↺</button>' : ''}
       ${sel ? '<span class="mi-check">✓</span>' : ''}
     </div>`;
   };
@@ -2270,6 +2279,17 @@ function bindEvents() {
       renderModelDropdown();
       if (id === selectedModel) { updateModelButton(); updateComposerMode(); }
       toast(`已将 ${id} 标记为 ${next === 'image' ? '🎨 绘图' : '💬 文本'} 模型`, 'success');
+      e.stopPropagation();
+      return;
+    }
+    // 点击"非流式"标签 → 解除该模型的非流式锁定（改回流式）
+    const nsTag = e.target.closest('.mi-ns-toggle');
+    if (nsTag) {
+      const id = nsTag.dataset.id;
+      delete settings.noStreamModels[id];
+      await saveSettings();
+      renderModelDropdown();
+      toast(`已解除 ${id} 的非流式锁定，恢复流式请求`, 'success');
       e.stopPropagation();
       return;
     }
