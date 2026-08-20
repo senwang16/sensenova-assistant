@@ -86,6 +86,8 @@ function normalizeImageSize(size) {
 
 /* 模型类型识别关键词（小写匹配） */
 const IMAGE_KEYWORDS = ['image', 'u1-fast', 'draw', 'diffusion', 'dall', 'flux', 'seedream', 'sdxl', 'sd3', 'stable-diffusion', 'picture'];
+// 视频/多模态生成模型（如 Google veo、gemini-image 等），既非对话也非本扩展支持的图片接口，发送前拦截
+const VIDEO_KEYWORDS = ['veo', '-generate-preview', 'imagegen', 'image-gen', 'video', 'generatecontent'];
 const CHAT_KEYWORDS = ['sensechat', 'chat', 'glm', 'deepseek', 'gpt', 'qwen', 'llama', 'ernie', 'hunyuan', 'kimi', 'moonshot', 'minimax', 'abab', 'baichuan', 'internlm', 'yi-'];
 
 const MIN_SUMMARY_OVERFLOW = 6;                // 综述触发阈值：窗口外未综述消息 ≥ 6 条（约 3 轮）
@@ -720,6 +722,7 @@ async function moveSessionCategory(id) {
 /* ---------------- 模型分类 ---------------- */
 function classifyModel(id) {
   const s = String(id || '').toLowerCase();
+  if (VIDEO_KEYWORDS.some(k => s.includes(k))) return 'video';
   if (IMAGE_KEYWORDS.some(k => s.includes(k))) return 'image';
   if (CHAT_KEYWORDS.some(k => s.includes(k))) return 'chat';
   return 'chat'; // 兜底默认为文本模型，可手动修正
@@ -1427,6 +1430,11 @@ async function handleSend() {
   }
 
   const modelType = getEffectiveType(selectedModel);
+  // 视频/多模态生成模型本扩展不支持（非对话、非图片接口），直接拦截提示，避免 404
+  if (modelType === 'video') {
+    toast(`「${selectedModel}」是视频生成模型，当前扩展暂不支持视频生成，请选择文本或绘图模型`, 'error');
+    return;
+  }
   const sid = currentSessionId;                    // 锁定目标会话：之后切换聊天不影响本任务归属
   const ctrl = new AbortController();
   generating.set(sid, ctrl);
@@ -1527,6 +1535,16 @@ async function doChat(prompt, signal) {
   // 是否用流式：全局开关 + 该模型未被标记为"流式异常"
   const wantStream = settings.streamOutput !== false && !settings.noStreamModels[selectedModel];
 
+  // 生成中计时提示：首字/首 token 前显示已等待秒数，让用户知道模型在响应而非卡死
+  const gStart = Date.now();
+  const firstUsable = () => msg.content || msg._reasoning;
+  const gTimer = setInterval(() => {
+    if (!isCur()) return;
+    if (firstUsable()) { clearInterval(gTimer); return; } // 已有输出，交给 paint 展示
+    const s = Math.floor((Date.now() - gStart) / 1000);
+    notice(`⏳ 模型思考中… 已等待 ${s}s（${wantStream?'流式':'非流式'}）。${s >= 25 ? '若超 60s 无输出可点停止后尝试切换流式/非流式。' : ''}`);
+  }, 1000);
+
   try {
     let full;
     try {
@@ -1583,6 +1601,7 @@ async function doChat(prompt, signal) {
       pushError('请求失败：' + e.message + hint, e.needSettings, msgs, sid);
     }
   }
+  clearInterval(gTimer);
   if (isCur()) scrollToBottom();
 }
 
@@ -1773,21 +1792,28 @@ function renderModelDropdown() {
   }
 
   const kw = mdFilterText.trim().toLowerCase();
-  const chat = [], image = [];
+  const chat = [], image = [], other = [];
   cachedModels.forEach(m => {
     if (kw && !m.id.toLowerCase().includes(kw)) return;
-    (getEffectiveType(m.id) === 'image' ? image : chat).push(m);
+    const t = getEffectiveType(m.id);
+    if (t === 'video') other.push(m);
+    else if (t === 'image') image.push(m);
+    else chat.push(m);
   });
 
-  $('#mdCount').textContent = kw ? `${chat.length + image.length}/${cachedModels.length}` : `${cachedModels.length} 个`;
+  $('#mdCount').textContent = kw ? `${chat.length + image.length + other.length}/${cachedModels.length}` : `${cachedModels.length} 个`;
 
   const item = (m) => {
     const sel = m.id === selectedModel;
     const t = getEffectiveType(m.id);
     const ovr = !!settings.modelTypeOverrides[m.id];
-    return `<div class="model-item${sel ? ' selected' : ''}" data-id="${escapeHtml(m.id)}">
-      <button class="type-toggle${ovr ? ' overridden' : ''}" data-id="${escapeHtml(m.id)}"
-              title="点击切换类型（当前：${t === 'image' ? '🎨 绘图' : '💬 文本'}）">${t === 'image' ? '🎨' : '💬'}</button>
+    const tIcon = t === 'image' ? '🎨' : '💬';
+    const isVideo = t === 'video';
+    return `<div class="model-item${sel ? ' selected' : ''}${isVideo ? ' muted' : ''}" data-id="${escapeHtml(m.id)}">
+      ${isVideo
+        ? '<span class="type-toggle" style="pointer-events:none" title="视频生成模型，暂不支持">🎬</span>'
+        : `<button class="type-toggle${ovr ? ' overridden' : ''}" data-id="${escapeHtml(m.id)}"
+             title="点击切换类型（当前：${t === 'image' ? '🎨 绘图' : '💬 文本'}）">${tIcon}</button>`}
       <span class="mi-name" title="${escapeHtml(m.id)}">${escapeHtml(m.id)}</span>
       ${settings.noStreamModels[m.id] ? '<button class="mi-ns-toggle" data-id="' + escapeHtml(m.id) + '" title="该模型被自动锁定为非流式。点击解除，恢复流式请求（若仍异常会再次自动降级）">非流式 ↺</button>' : ''}
       ${sel ? '<span class="mi-check">✓</span>' : ''}
@@ -1797,6 +1823,7 @@ function renderModelDropdown() {
   let html = '';
   if (chat.length) html += `<div class="md-group-title">💬 文本模型（${chat.length}）</div>` + chat.map(item).join('');
   if (image.length) html += `<div class="md-group-title">🎨 绘图模型（${image.length}）</div>` + image.map(item).join('');
+  if (other.length) html += `<div class="md-group-title">🎬 其他（不支持）</div>` + other.map(item).join('');
   listEl.innerHTML = html || '<div class="md-empty">没有匹配的模型</div>';
 }
 
@@ -1851,13 +1878,25 @@ function renderProviderSelect() {
   }).join('');
 }
 
-/** 切换供应商：投影配置 + 载入模型 + 刷新 UI + 明确反馈 */
+/** 切换供应商：投影配置 + 载入模型 + 刷新 UI + 明确反馈
+ *  opts.bindSession=true 时手动切换，把当前会话绑定到新供应商
+ *  opts.followSession=true（switchSession 内部使用）仅投影，不改会话绑定 */
 function switchProvider(id, opts = {}) {
   const p = (settings.providers || []).find(x => x.id === id);
   if (!p) return;
   projectProvider(p);
   saveSettings();
   renderProviderSelect();
+  // 手动切换：当前会话改绑到新供应商（避免"绑死"原供应商无法更换）
+  if (opts.bindSession) {
+    const s = curSession();
+    if (s) {
+      s.providerId = p.id;
+      // 若原会话模型在新商下不存在，则按新商模型列表选一个
+      if (!cachedModels.some(m => m.id === s.model)) { autoSelectModel(); syncSessionModel(); }
+      persistHistory();
+    }
+  }
   // 会话级模型跟随该供应商的模型列表
   autoSelectModel();
   updateModelButton();
@@ -2174,7 +2213,7 @@ function bindEvents() {
       const pid = item.dataset.pid;
       if (pid === curProvider()?.id) return; // 已是当前，跳过高亮闪烁
       applySettingsFromPanel();          // 先把当前供应商编辑内容写回
-      switchProvider(pid);               // 切换并刷新（含聊天窗口模型列表）
+      switchProvider(pid, { bindSession: true }); // 手动切换（含聊天窗口模型列表），并把当前会话改绑新供应商
     }
   });
 
@@ -2182,15 +2221,17 @@ function bindEvents() {
     const p = (settings.providers || []).find(x => x.id === pid);
     if (!p) return;
     if (settings.providers.length <= 1) { toast('至少需保留一个供应商', 'error'); return; }
-    if (!confirm('确认删除供应商「' + p.name + '」？其 Key、模型列表与设置将一并删除，无法恢复。')) return;
+    if (!confirm('确认删除供应商「' + p.name + '」？其 Key、模型列表与设置将一并删除，无法恢复。该供应商下的聊天将自动改用当前供应商。')) return;
     settings.providers = settings.providers.filter(x => x.id !== pid);
     settings.currentProviderId = settings.providers[0].id;
+    // 同步会话：被删供应商绑定的会话 → 重定向到新当前供应商（避免悬空引用）
+    sessions.forEach(s => { if (s.providerId === pid) { s.providerId = settings.currentProviderId; } });
     projectProvider(settings.providers[0]);
     saveSettings();
     renderProviderSelect(); syncProviderEditor();
     // 刷新聊天窗口的模型列表与按钮
-    autoSelectModel(); updateModelButton(); updateComposerMode(); renderModelDropdown();
-    toast('已删除供应商', 'success');
+    autoSelectModel(); updateModelButton(); updateComposerMode(); renderModelDropdown(); renderSessionList(); applySessionUI();
+    toast('已删除供应商，相关聊天已改用当前供应商', 'success');
   }
 
   // 预设新增：读取当前面板填好的表单作为新供应商
@@ -2295,6 +2336,8 @@ function bindEvents() {
     }
     const item = e.target.closest('.model-item');
     if (item) {
+      // 视频/不支持模型不可选（muted）
+      if (item.classList.contains('muted')) { toast('该模型暂不支持生成，请选择文本或绘图模型', 'error'); return; }
       selectedModel = item.dataset.id;
       settings.lastModel = selectedModel;
       syncSessionModel();          // 模型选择记住到当前聊天

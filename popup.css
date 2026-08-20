@@ -518,6 +518,9 @@ html.fullscreen #mainCol > .header .brand-sub { display: inline; }
 }
 .model-item:hover { background: var(--hover); }
 .model-item.selected { background: var(--accent-soft); }
+.model-item.muted { opacity: 0.5; }
+.model-item.muted:hover { background: transparent; }
+.model-item.muted .mi-name { text-decoration: line-through; }
 
 .type-toggle {
   flex: none;
