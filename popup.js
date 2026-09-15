@@ -18,7 +18,9 @@ const DEFAULTS = {
   imageEndpoint: '/images/generations',
   modelsEndpoint: '/models',
   keys: [],                                  // [{id, value, status, failCount, coolingUntil, coolReason}]
-  imageConfig: { size: '2048x2048', watermark: false },
+  imageConfig: { size: '2048x2048', watermark: false, tier: '2K', ratio: '16:9' },  // size 用于商汤等精确像素供应商；tier+ratio 用于 Agnes
+  videoEnabled: false,                       // 视频生成能力开关（供应商可覆盖；Agnes 下默认 true）
+  lastVideoTs: 0,                            // 上次发起视频生成的时间戳（用于 1RPM 冷却）
   modelTypeOverrides: {},                    // { modelId: 'chat' | 'image' } 手动修正
   theme: 'light',
   streamOutput: true,               // 流式输出总开关（false = 全部使用非流式，最稳）
@@ -42,6 +44,7 @@ const DEFAULTS = {
 /* 常见供应商预设模板（新增强可按需选用，避免手填） */
 const PROVIDER_PRESETS = [
   { name: '商汤 SenseNova', baseUrl: 'https://token.sensenova.cn/v1', chatEndpoint: '/chat/completions', imageEndpoint: '/images/generations', modelsEndpoint: '/models' },
+  { name: 'Agnes', baseUrl: 'https://apihub.agnes-ai.com/v1', chatEndpoint: '/chat/completions', imageEndpoint: '/images/generations', modelsEndpoint: '/models' },
   { name: 'Google Gemini (OpenAI 兼容)', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' },
   { name: 'Kimi (Moonshot)', baseUrl: 'https://api.moonshot.cn/v1', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' },
   { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' },
@@ -85,10 +88,10 @@ function normalizeImageSize(size) {
 }
 
 /* 模型类型识别关键词（小写匹配） */
-const IMAGE_KEYWORDS = ['image', 'u1-fast', 'draw', 'diffusion', 'dall', 'flux', 'seedream', 'sdxl', 'sd3', 'stable-diffusion', 'picture'];
+const IMAGE_KEYWORDS = ['image', 'u1-fast', 'draw', 'diffusion', 'dall', 'flux', 'seedream', 'sdxl', 'sd3', 'stable-diffusion', 'picture', 'agnes-image'];
 // 视频/多模态生成模型（如 Google veo、gemini-image 等），既非对话也非本扩展支持的图片接口，发送前拦截
-const VIDEO_KEYWORDS = ['veo', '-generate-preview', 'imagegen', 'image-gen', 'video', 'generatecontent'];
-const CHAT_KEYWORDS = ['sensechat', 'chat', 'glm', 'deepseek', 'gpt', 'qwen', 'llama', 'ernie', 'hunyuan', 'kimi', 'moonshot', 'minimax', 'abab', 'baichuan', 'internlm', 'yi-'];
+const VIDEO_KEYWORDS = ['veo', '-generate-preview', 'imagegen', 'image-gen', 'video', 'generatecontent', 'agnes-video'];
+const CHAT_KEYWORDS = ['sensechat', 'chat', 'glm', 'deepseek', 'gpt', 'qwen', 'llama', 'ernie', 'hunyuan', 'kimi', 'moonshot', 'minimax', 'abab', 'baichuan', 'internlm', 'yi-', 'agnes'];
 
 const MIN_SUMMARY_OVERFLOW = 6;                // 综述触发阈值：窗口外未综述消息 ≥ 6 条（约 3 轮）
 const MEM_SEARCH_BUDGET_MS = 8000;             // 记忆检索总预算：超时放弃本层，绝不阻塞发送
@@ -97,6 +100,8 @@ const MEM_PROBE_TIMEOUT_MS = 6000;             // embeddings 探测限时（单�
 const MEM_API_EMBED_TIMEOUT_MS = 15000;        // API 嵌入单次限时
 const MAX_IMAGE_COUNT = 20;                   // 最多缓存 20 张图
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;     // 图片缓存总量上限 10MB
+const MAX_VIDEO_COUNT = 10;                   // 最多缓存 10 段视频
+const MAX_VIDEO_BYTES = 300 * 1024 * 1024;    // 视频缓存总量上限 300MB
 const COOLDOWN_429_MS = 60 * 1000;            // 429 限流冷却 60s
 const COOLDOWN_401_MS = 10 * 60 * 1000;       // 401 鉴权失败冷却 10min
 const BACKOFF_BASE_MS = 2000;                 // 指数退避基准 2s
@@ -254,6 +259,8 @@ function projectProvider(p) {
   settings.noStreamModels = p.noStreamModels;
   settings.lastModel = p.lastModel || '';
   settings.imageConfig = p.imageConfig;
+  settings.videoEnabled = p.videoEnabled ?? false;
+  settings.lastVideoTs = p.lastVideoTs || 0;
   cachedModels = p.cachedModels || [];
 }
 
@@ -270,6 +277,8 @@ function absorbProvider() {
   p.noStreamModels = settings.noStreamModels;
   p.lastModel = settings.lastModel || '';
   p.imageConfig = settings.imageConfig;
+  p.videoEnabled = settings.videoEnabled;
+  p.lastVideoTs = settings.lastVideoTs;
   p.cachedModels = cachedModels;
 }
 
@@ -1360,15 +1369,15 @@ async function doImageGeneration(prompt, signal) {
     if (!settings.imageEndpoint) {
       throw new Error('当前供应商「' + (curProvider()?.name || '') + '」没有绘图能力，请切换到支持绘图（如商汤）的供应商，或在该供应商设置中填写绘图端点。');
     }
+    // 按供应商组装请求体：Agnes 用档位+比例，其他供应商用精确像素尺寸
+    const isAgnes = (curProvider()?.name || '').toLowerCase().includes('agnes');
+    const body = isAgnes
+      ? { model: selectedModel, prompt, size: settings.imageConfig.tier || '2K', ratio: settings.imageConfig.ratio || '16:9' }
+      : { model: selectedModel, prompt, size: normalizeImageSize(settings.imageConfig.size), watermark: !!settings.imageConfig.watermark };
     const res = await requestWithRotation(joinUrl(settings.baseUrl, settings.imageEndpoint), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: selectedModel,
-        prompt,
-        size: normalizeImageSize(settings.imageConfig.size), // 白名单校正，杜绝 400
-        watermark: !!settings.imageConfig.watermark
-      })
+      body: JSON.stringify(body)
     }, { onNotice: notice, signal });
 
     const data = await res.json().catch(() => null);
@@ -1425,6 +1434,145 @@ async function enforceImageLimitsAndSave(msgs = chatHistory) {
   await persistHistory();
 }
 
+/** 视频生成：创建任务 + 轮询结果 + Base64 缓存 */
+async function doVideoGeneration(prompt, signal) {
+  const sid = currentSessionId;
+  const sess = sessions.find(s => s.id === sid);
+  if (!sess) return;
+  const msgs = sess.messages;
+  const isCur = () => currentSessionId === sid;
+  const elOf = () => document.querySelector(`#messages [data-id="${msg.id}"]`);
+
+  const msg = {
+    id: uid(), ts: Date.now(), model: selectedModel, modelType: 'video',
+    role: 'assistant', type: 'video', content: '', prompt,
+    pending: true, cached: false
+  };
+  msgs.push(msg);
+  appendMessageEl(msg);
+  await persistHistory();
+
+  const notice = (n) => {
+    if (!isCur()) return;
+    const el = elOf()?.querySelector('.bubble-notice');
+    if (el) { el.textContent = n; el.classList.add('show'); }
+  };
+
+  try {
+    if (!settings.videoEnabled) {
+      throw new Error('当前供应商未启用视频生成能力');
+    }
+    // 记录本次发起时间（用于 1RPM 冷却）
+    settings.lastVideoTs = Date.now();
+    await saveSettings();
+
+    notice('🎬 正在创建视频生成任务…');
+    // 1. 创建任务：POST /v1/videos
+    const createRes = await requestWithRotation(joinUrl(settings.baseUrl, '/videos'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: selectedModel,
+        prompt,
+        seconds: '4',  // 官方要求必须字符串
+        size: settings.imageConfig.tier || '2K',
+        ratio: settings.imageConfig.ratio || '16:9'
+      })
+    }, { onNotice: notice, signal });
+
+    const createData = await createRes.json().catch(() => null);
+    if (createData?.error) throw new Error(createData.error.message || '创建视频任务失败');
+    const videoId = createData?.video_id || createData?.id;
+    if (!videoId) throw new Error('接口未返回 video_id');
+
+    // 2. 轮询结果：GET /agnesapi?video_id=<id>（3~5s 间隔，总上限 5min）
+    notice('⏳ 视频生成中，正在轮询结果…');
+    const pollUrl = `https://apihub.agnes-ai.com/agnesapi?video_id=${encodeURIComponent(videoId)}`;
+    const maxPollMs = 5 * 60 * 1000;
+    const pollIntervalMs = 4000;
+    const startTs = Date.now();
+    let videoUrl = null;
+
+    while (Date.now() - startTs < maxPollMs) {
+      if (signal?.aborted) throw abortError();
+      await abortableSleep(pollIntervalMs, signal);
+      notice(`⏳ 视频生成中… 已等待 ${Math.floor((Date.now() - startTs) / 1000)}s`);
+      try {
+        const pollRes = await fetch(pollUrl, { method: 'GET' });
+        if (!pollRes.ok) continue;
+        const pollData = await pollRes.json();
+        if (pollData.status === 'success' || pollData.status === 'completed') {
+          videoUrl = pollData.video_url || pollData.url;
+          break;
+        } else if (pollData.status === 'failed') {
+          throw new Error(pollData.error || '视频生成失败');
+        }
+        // status === 'processing' 或未知 → 继续轮询
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        // 网络错误等 → 继续轮询
+      }
+    }
+
+    if (!videoUrl) throw new Error('视频生成超时（5 分钟）');
+
+    // 3. 下载视频 → Base64 缓存
+    notice('📥 正在下载视频并缓存到本地…');
+    try {
+      msg.content = await fetchMediaAsBase64(videoUrl, 'video/mp4');
+      msg.cached = true;
+    } catch (_) {
+      msg.content = videoUrl;  // 兜底：保留原始链接
+      msg.cached = false;
+    }
+
+    msg.pending = false;
+    await enforceVideoLimitsAndSave(msgs);
+    if (isCur()) { const n = elOf(); if (n) n.replaceWith(buildMessageEl(msg)); }
+    touchSession(sid);
+    toast('🎬 视频生成完成', 'success');
+  } catch (e) {
+    const i = msgs.indexOf(msg); if (i > -1) msgs.splice(i, 1);
+    await persistHistory();
+    if (isCur()) { const n = elOf(); if (n) n.remove(); }
+    if (e.name === 'AbortError') {
+      toast('已停止视频生成');
+    } else {
+      pushError('视频生成失败：' + e.message, e.needSettings, msgs, sid);
+    }
+  }
+  if (isCur()) scrollToBottom();
+}
+
+/** 视频历史限额：最多 10 段且总量 ≤ 300MB，超出删除最旧 */
+async function enforceVideoLimitsAndSave(msgs = chatHistory) {
+  const isCachedVideo = (m) => m.type === 'video' && isDataUrl(m.content);
+  const totalBytes = () => msgs.filter(isCachedVideo).reduce((s, m) => s + m.content.length * 0.75, 0);
+  let vids = msgs.filter(isCachedVideo);
+  let total = totalBytes();
+  while ((vids.length > MAX_VIDEO_COUNT || total > MAX_VIDEO_BYTES)) {
+    const idx = msgs.findIndex(isCachedVideo);
+    if (idx === -1) break;
+    msgs.splice(idx, 1);
+    vids = msgs.filter(isCachedVideo);
+    total = totalBytes();
+  }
+  await persistHistory();
+}
+
+/** 下载媒体 URL → Base64（支持图片/视频） */
+async function fetchMediaAsBase64(url, expectedMime = 'image/png') {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const blob = await res.blob();
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result);
+    fr.onerror = () => reject(new Error('媒体读取失败'));
+    fr.readAsDataURL(blob);
+  });
+}
+
 /* ---------------- 发送总入口 ---------------- */
 async function handleSend() {
   if (generating.has(currentSessionId)) {
@@ -1447,10 +1595,19 @@ async function handleSend() {
   }
 
   const modelType = getEffectiveType(selectedModel);
-  // 视频/多模态生成模型本扩展不支持（非对话、非图片接口），直接拦截提示，避免 404
-  if (modelType === 'video') {
-    toast(`「${selectedModel}」是视频生成模型，当前扩展暂不支持视频生成，请选择文本或绘图模型`, 'error');
+  // 视频模型：videoEnabled 时放行，否则拦截提示
+  if (modelType === 'video' && !settings.videoEnabled) {
+    toast(`「${selectedModel}」是视频生成模型，当前供应商未启用视频能力，请在设置中开启或切换供应商`, 'error');
     return;
+  }
+  // 视频 1RPM 冷却检查
+  if (modelType === 'video' && settings.videoEnabled) {
+    const elapsed = Date.now() - settings.lastVideoTs;
+    if (elapsed < 60000) {
+      const remain = Math.ceil((60000 - elapsed) / 1000);
+      toast(`⏱ 视频限频 1/分钟，距离下次可生成还需 ${remain}s`, 'error');
+      return;
+    }
   }
   const sid = currentSessionId;                    // 锁定目标会话：之后切换聊天不影响本任务归属
   const ctrl = new AbortController();
@@ -1480,6 +1637,8 @@ async function handleSend() {
   try {
     if (modelType === 'image') {
       await doImageGeneration(text, ctrl.signal);
+    } else if (modelType === 'video' && settings.videoEnabled) {
+      await doVideoGeneration(text, ctrl.signal);
     } else {
       await doChat(text, ctrl.signal);
     }
@@ -1685,6 +1844,27 @@ function buildMessageEl(m) {
     return wrap;
   }
 
+  if (m.type === 'video') {
+    wrap.className = 'msg ai';
+    if (m.pending) {
+      wrap.innerHTML = `<div class="bubble"><div class="pending-line"><span class="spinner"></span>🎬 正在生成视频…</div><div class="bubble-notice"></div></div>`;
+      return wrap;
+    }
+    const badge = m.cached
+      ? '<span class="chip chip-ok">✓ 已转存本地缓存（永不过期）</span>'
+      : '<span class="chip chip-warn">⚠ 原始链接可能过期，请尽快保存</span>';
+    wrap.innerHTML = `
+      <div class="bubble video-bubble">
+        <video class="gen-video" controls src="${escapeHtml(m.content)}" data-id="${m.id}"></video>
+        <div class="img-chips">${badge}</div>
+        <div class="img-actions">
+          <button class="mini-btn" data-act="download" data-id="${m.id}">⬇ 下载视频</button>
+        </div>
+        <div class="msg-meta">${time} · ${escapeHtml(m.model || '')}</div>
+      </div>`;
+    return wrap;
+  }
+
   // 文本消息
   wrap.className = 'msg ' + (m.role === 'user' ? 'user' : 'ai');
   const bodyHtml = m.pending
@@ -1771,10 +1951,17 @@ async function copyImage(msg) {
 
 function downloadImage(msg) {
   if (!msg) return;
-  const mimeMatch = String(msg.content).match(/^data:image\/(\w+)/);
-  const ext = mimeMatch ? (mimeMatch[1] === 'jpeg' ? 'jpg' : mimeMatch[1]) : 'png';
+  const content = String(msg.content);
+  let ext = 'png';
+  const imgMatch = content.match(/^data:image\/(\w+)/);
+  const vidMatch = content.match(/^data:video\/([\w]+)/);
+  if (imgMatch) {
+    ext = imgMatch[1] === 'jpeg' ? 'jpg' : imgMatch[1];
+  } else if (vidMatch) {
+    ext = vidMatch[1] === 'quicktime' ? 'mov' : vidMatch[1];
+  }
   chrome.downloads.download(
-    { url: msg.content, filename: `sensenova-${formatFileTs(msg.ts || Date.now())}.${ext}` },
+    { url: content, filename: `sensenova-${formatFileTs(msg.ts || Date.now())}.${ext}` },
     (downloadId) => {
       if (downloadId === undefined) {
         toast('下载失败：' + (chrome.runtime.lastError?.message || '未知错误'), 'error');
@@ -1824,11 +2011,12 @@ function renderModelDropdown() {
     const sel = m.id === selectedModel;
     const t = getEffectiveType(m.id);
     const ovr = !!settings.modelTypeOverrides[m.id];
-    const tIcon = t === 'image' ? '🎨' : '💬';
+    const tIcon = t === 'image' ? '🎨' : (t === 'video' ? '🎬' : '💬');
     const isVideo = t === 'video';
-    return `<div class="model-item${sel ? ' selected' : ''}${isVideo ? ' muted' : ''}" data-id="${escapeHtml(m.id)}">
+    const videoDisabled = isVideo && !settings.videoEnabled;
+    return `<div class="model-item${sel ? ' selected' : ''}${videoDisabled ? ' muted' : ''}" data-id="${escapeHtml(m.id)}">
       ${isVideo
-        ? '<span class="type-toggle" style="pointer-events:none" title="视频生成模型，暂不支持">🎬</span>'
+        ? `<span class="type-toggle" style="${videoDisabled ? 'pointer-events:none' : ''}" title="${videoDisabled ? '视频生成未启用' : '视频生成模型'}">🎬</span>`
         : `<button class="type-toggle${ovr ? ' overridden' : ''}" data-id="${escapeHtml(m.id)}"
              title="点击切换类型（当前：${t === 'image' ? '🎨 绘图' : '💬 文本'}）">${tIcon}</button>`}
       <span class="mi-name" title="${escapeHtml(m.id)}">${escapeHtml(m.id)}</span>
@@ -1840,7 +2028,7 @@ function renderModelDropdown() {
   let html = '';
   if (chat.length) html += `<div class="md-group-title">💬 文本模型（${chat.length}）</div>` + chat.map(item).join('');
   if (image.length) html += `<div class="md-group-title">🎨 绘图模型（${image.length}）</div>` + image.map(item).join('');
-  if (other.length) html += `<div class="md-group-title">🎬 其他（不支持）</div>` + other.map(item).join('');
+  if (other.length) html += `<div class="md-group-title">🎬 视频模型（${other.length}）</div>` + other.map(item).join('');
   listEl.innerHTML = html || '<div class="md-empty">没有匹配的模型</div>';
 }
 
