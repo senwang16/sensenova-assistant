@@ -282,7 +282,7 @@ function absorbProvider() {
   p.cachedModels = cachedModels;
 }
 
-function isDataUrl(s) { return typeof s === 'string' && s.startsWith('data:image'); }
+function isDataUrl(s) { return typeof s === 'string' && /^data:(image|video)\//.test(s); }
 
 function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
@@ -2196,7 +2196,8 @@ function applySettingsFromPanel() {
     return s;
   };
   settings.chatEndpoint = norm($('#inpChatEndpoint').value, DEFAULTS.chatEndpoint);
-  settings.imageEndpoint = norm($('#inpImageEndpoint').value, DEFAULTS.imageEndpoint);
+  // 绘图端点留空 = 无绘图能力（Google/Kimi 等），不能用默认值覆盖空值
+  settings.imageEndpoint = norm($('#inpImageEndpoint').value, settings.imageEndpoint || '');
   settings.modelsEndpoint = norm($('#inpModelsEndpoint').value, DEFAULTS.modelsEndpoint);
   settings.streamOutput = $('#inpStream').checked;
 
