@@ -1485,17 +1485,18 @@ async function doVideoGeneration(prompt, signal) {
     const videoId = createData?.video_id || createData?.id;
     if (!videoId) throw new Error('接口未返回 video_id');
 
-    // 2. 轮询结果：GET /agnesapi?video_id=<id>（3~5s 间隔，总上限 5min）
+    // 2. 轮询结果：GET /agnesapi?video_id=<id>（前快后慢，总上限 5min）
     notice('⏳ 视频生成中，正在轮询结果…');
     const pollUrl = `https://apihub.agnes-ai.com/agnesapi?video_id=${encodeURIComponent(videoId)}`;
     const maxPollMs = 5 * 60 * 1000;
-    const pollIntervalMs = 4000;
     const startTs = Date.now();
+    // 首 30s 每 2s 查询（尽快感知结果），之后每 30s 步进 1s，封顶 5s——长任务又不至于请求过密
+    const pollIntervalMs = () => Math.min(2000 + Math.floor((Date.now() - startTs) / 30000) * 1000, 5000);
     let videoUrl = null;
 
     while (Date.now() - startTs < maxPollMs) {
       if (signal?.aborted) throw abortError();
-      await abortableSleep(pollIntervalMs, signal);
+      await abortableSleep(pollIntervalMs(), signal);
       notice(`⏳ 视频生成中… 已等待 ${Math.floor((Date.now() - startTs) / 1000)}s`);
       try {
         const pollRes = await fetch(pollUrl, { method: 'GET' });
@@ -1564,7 +1565,11 @@ async function enforceVideoLimitsAndSave(msgs = chatHistory) {
 async function fetchMediaAsBase64(url, expectedMime = 'image/png') {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const blob = await res.blob();
+  let blob = await res.blob();
+  // 服务器可能未返回正确的 Content-Type（如 octet-stream），兜底修正 MIME，保证 data URL 前缀可靠
+  if (!/^(image|video)\//.test(blob.type || '')) {
+    blob = new Blob([blob], { type: expectedMime });
+  }
   return new Promise((resolve, reject) => {
     const fr = new FileReader();
     fr.onload = () => resolve(fr.result);
@@ -1810,6 +1815,26 @@ function toggleEmpty() {
   $('#emptyState').classList.toggle('hidden', chatHistory.length > 0);
 }
 
+/* 视频懒加载：滚动进入视口附近才真正挂载 Base64，避免弹窗每次打开都解码整段大视频 */
+let videoLazyObserver = null;
+function observeVideoLazy(vEl) {
+  if (!vEl) return;
+  if (!videoLazyObserver && 'IntersectionObserver' in window) {
+    videoLazyObserver = new IntersectionObserver((entries) => {
+      entries.forEach(en => {
+        if (en.isIntersecting) {
+          const v = en.target;
+          v.preload = 'metadata';
+          v.src = v.dataset.src || v.src;
+          videoLazyObserver.unobserve(v);
+        }
+      });
+    }, { root: $('#chatScroll'), rootMargin: '400px 0px' });
+  }
+  if (videoLazyObserver) videoLazyObserver.observe(vEl);
+  else vEl.src = vEl.dataset.src || '';
+}
+
 function buildMessageEl(m) {
   const wrap = document.createElement('div');
   const time = formatTime(m.ts);
@@ -1855,13 +1880,14 @@ function buildMessageEl(m) {
       : '<span class="chip chip-warn">⚠ 原始链接可能过期，请尽快保存</span>';
     wrap.innerHTML = `
       <div class="bubble video-bubble">
-        <video class="gen-video" controls src="${escapeHtml(m.content)}" data-id="${m.id}"></video>
+        <video class="gen-video" controls preload="none" data-src="${escapeHtml(m.content)}" data-id="${m.id}"></video>
         <div class="img-chips">${badge}</div>
         <div class="img-actions">
           <button class="mini-btn" data-act="download" data-id="${m.id}">⬇ 下载视频</button>
         </div>
         <div class="msg-meta">${time} · ${escapeHtml(m.model || '')}</div>
       </div>`;
+    observeVideoLazy(wrap.querySelector('video.gen-video'));
     return wrap;
   }
 
