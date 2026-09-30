@@ -562,6 +562,30 @@ html.fullscreen #mainCol > .header .brand-sub { display: inline; }
 }
 .mi-check { flex: none; color: var(--accent); font-size: 12px; }
 
+/* ⚡ 自动路由项（置顶） */
+.model-item.md-auto {
+  background: linear-gradient(90deg, var(--accent-soft), transparent);
+  margin-bottom: 4px;
+}
+.md-auto-sub {
+  display: block;
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 1px;
+}
+
+/* 参数组（图片：Agnes 档位组 / 商汤像素组，二选一显示） */
+.param-group { display: inline-flex; align-items: center; gap: 6px; }
+#selImgTier, #selImgRatio {
+  font-size: 11px;
+  padding: 3px 6px;
+  border-radius: 7px;
+  max-width: 110px;
+}
+
 /* 非流式模型标记（可点击解除） */
 .mi-ns-toggle {
   flex: none;
@@ -588,8 +612,9 @@ html.fullscreen #mainCol > .header .brand-sub { display: inline; }
   background: var(--bg);
 }
 
-/* 绘图参数行（嵌在底部工具栏右侧角落） */
-#imageParamsRow {
+/* 绘图 / 视频参数行（嵌在底部工具栏右侧角落） */
+#imageParamsRow,
+#videoParamsRow {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -606,6 +631,13 @@ html.fullscreen #mainCol > .header .brand-sub { display: inline; }
   padding: 3px 6px;
   border-radius: 7px;
   max-width: 150px;
+}
+#selVideoSeconds,
+#selVideoAspect {
+  font-size: 11px;
+  padding: 3px 6px;
+  border-radius: 7px;
+  max-width: 110px;
 }
 
 /* 开关 */

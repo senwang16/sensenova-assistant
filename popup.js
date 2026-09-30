@@ -19,8 +19,11 @@ const DEFAULTS = {
   modelsEndpoint: '/models',
   keys: [],                                  // [{id, value, status, failCount, coolingUntil, coolReason}]
   imageConfig: { size: '2048x2048', watermark: false, tier: '2K', ratio: '16:9' },  // size 用于商汤等精确像素供应商；tier+ratio 用于 Agnes
-  videoEnabled: false,                       // 视频生成能力开关（供应商可覆盖；Agnes 下默认 true）
+  videoConfig: { seconds: '5', aspectRatio: '16:9' },  // 视频参数：秒数必须字符串 "4"–"12"；Agnes 2.5-flash 画幅走 aspect_ratio
+  videoEnabled: false,                       // 视频生成能力开关（需在设置中开启，默认关闭）
   lastVideoTs: 0,                            // 上次发起视频生成的时间戳（用于 1RPM 冷却）
+  allowedModels: [],                         // 模型白名单（空 = 不限制）；Agnes 预设填免费模型，避免误选收费模型
+  capabilityModels: { chat: '', image: '', video: '' }, // 自动路由的能力槽位（每供应商独立）
   modelTypeOverrides: {},                    // { modelId: 'chat' | 'image' } 手动修正
   theme: 'light',
   streamOutput: true,               // 流式输出总开关（false = 全部使用非流式，最稳）
@@ -41,10 +44,21 @@ const DEFAULTS = {
   }
 };
 
+/* Agnes 免费额度内的模型白名单（其余为收费模型，模型列表内直接隐藏，避免误选扣费）
+ * 能力分布：文本 / 图片 —— Agnes 与商汤均提供；视频 —— 仅 Agnes 提供 */
+const AGNES_FREE_MODELS = [
+  'agnes-3.0-flash', 'agnes-2.5-flash',
+  'agnes-image-2.0-flash', 'agnes-image-2.1-flash', 'agnes-image-2.5-flash',
+  'agnes-video-2.5-flash'
+];
+/* 自动路由的能力槽位默认值（Agnes） */
+const AGNES_DEFAULT_SLOTS = { chat: 'agnes-3.0-flash', image: 'agnes-image-2.5-flash', video: 'agnes-video-2.5-flash' };
+
 /* 常见供应商预设模板（新增强可按需选用，避免手填） */
 const PROVIDER_PRESETS = [
   { name: '商汤 SenseNova', baseUrl: 'https://token.sensenova.cn/v1', chatEndpoint: '/chat/completions', imageEndpoint: '/images/generations', modelsEndpoint: '/models' },
-  { name: 'Agnes', baseUrl: 'https://apihub.agnes-ai.com/v1', chatEndpoint: '/chat/completions', imageEndpoint: '/images/generations', modelsEndpoint: '/models' },
+  { name: 'Agnes', baseUrl: 'https://apihub.agnes-ai.com/v1', chatEndpoint: '/chat/completions', imageEndpoint: '/images/generations', modelsEndpoint: '/models',
+    videoEnabled: true, allowedModels: AGNES_FREE_MODELS, capabilityModels: AGNES_DEFAULT_SLOTS },
   { name: 'Google Gemini (OpenAI 兼容)', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' },
   { name: 'Kimi (Moonshot)', baseUrl: 'https://api.moonshot.cn/v1', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' },
   { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', chatEndpoint: '/chat/completions', imageEndpoint: '', modelsEndpoint: '/models' },
@@ -87,6 +101,286 @@ function normalizeImageSize(size) {
   return LEGACY_SIZE_MAP[s] || '2752x1536';
 }
 
+/* Agnes 视频 2.5 系列支持的画幅（官方文档）；秒数为字符串 "4"–"12"，默认 "5" */
+const VALID_VIDEO_RATIOS = ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'];
+function normalizeVideoSeconds(v) {
+  const n = parseInt(String(v ?? '').trim(), 10);
+  if (!Number.isFinite(n)) return '5';
+  return String(Math.max(4, Math.min(12, n)));
+}
+function normalizeVideoRatio(r) {
+  const s = String(r || '').trim();
+  return VALID_VIDEO_RATIOS.includes(s) ? s : '16:9';
+}
+
+/* Agnes 图片：档位（1K–4K）+ 比例（与商汤的精确像素白名单二选一） */
+const VALID_IMG_TIERS = ['1K', '2K', '3K', '4K'];
+const VALID_IMG_RATIOS = ['1:1', '3:4', '4:3', '16:9', '9:16', '2:3', '3:2', '21:9'];
+function normalizeImgTier(t) {
+  const s = String(t || '').trim().toUpperCase();
+  return VALID_IMG_TIERS.includes(s) ? s : '2K';
+}
+function normalizeImgRatio(r) {
+  const s = String(r || '').trim();
+  return VALID_IMG_RATIOS.includes(s) ? s : '16:9';
+}
+
+/** 组装视频创建请求体（Agnes 视频 2.5 / 2.5-flash 同一套参数） */
+function buildVideoBody(model, prompt) {
+  const cfg = settings.videoConfig || DEFAULTS.videoConfig;
+  return {
+    model,
+    prompt,
+    mode: 'text',                                  // 2.5 系列必填：text / keyframe / reference
+    seconds: String(cfg.seconds || '5'),            // 官方要求字符串，传数字会 400
+    size: VIDEO_MODEL_SIZE,                        // 2.5-flash 仅支持 "720P"
+    aspect_ratio: normalizeVideoRatio(cfg.aspectRatio) // 注意：不是 ratio
+  };
+}
+
+/** 由供应商 baseUrl 推导视频结果轮询地址（兼容国内站 / 自建网关，不硬编码域名） */
+function buildVideoPollUrl(videoId, model) {
+  let origin = 'https://apihub.agnes-ai.com';
+  try { origin = new URL(settings.baseUrl).origin; } catch (_) { /* 非法 baseUrl 时退回官方国际站 */ }
+  return `${origin}/agnesapi?video_id=${encodeURIComponent(videoId)}&model_name=${encodeURIComponent(model)}`;
+}
+
+/** 当前供应商是否为 Agnes（限流预算仅对 Agnes 免费 Key 生效） */
+function isAgnesProvider() {
+  return (curProvider()?.name || '').toLowerCase().includes('agnes');
+}
+
+/** 发送前申请限流配额：不足则排队等待并提示，返回实际等待毫秒
+ *  rpm 取官方「实际可执行 RPM」；文本/图片按可用 Key 数分摊，视频为账号级不放大 */
+async function acquireRate(kind, tier, onNotice, signal) {
+  if (!isAgnesProvider()) return 0;
+  let rpm;
+  if (kind === 'image') {
+    rpm = AGNES_RPM.image[String(tier || '2K').toUpperCase()] || AGNES_RPM.image['2K'];
+  } else {
+    rpm = AGNES_RPM[kind];
+  }
+  if (!rpm) return 0;
+  // 注意：不按 Key 数放大 —— Agnes 官方明确同类型 Key 共享同一限制池，
+  // 多把免费 Key 并不增加 RPM，放大记账只会让自己提前撞 429。
+  const minGap = Math.ceil(60000 / rpm);
+  const bucket = kind + ':' + (kind === 'image' ? String(tier || '') : '');
+  const last = _rateLastTs[bucket] || 0;
+  const wait = Math.max(0, last + minGap - Date.now());
+  if (wait > 0) {
+    if (onNotice) onNotice(`⏱ 免费额度限流（约 ${rpm}/分钟），排队 ${Math.ceil(wait / 1000)}s 后发送…`);
+    await abortableSleep(wait, signal);
+  }
+  _rateLastTs[bucket] = Date.now();
+  return wait;
+}
+
+/* ---------------- 多模态自动路由 ----------------
+ * 模型下拉顶部的伪模型「⚡ 自动」：按输入意图自动路由到 文本 / 图片 / 视频。
+ * 三级判定：显式指令（/img） → 强模式正则（只认祈使结构） → 兜底文本。
+ * 兜底永远是「聊天」——宁可不生成，也绝不误触发生成（生成有成本且视频限频）。
+ */
+const AUTO_MODEL_ID = '__auto__';
+
+// 显式指令前缀（中文分支不能用 \b，CJK 非 \w 字符，改用 (?=\s|$) 前瞻）
+const INTENT_COMMAND_RE = /^\s*\/(img|image|draw|video|vid|chat|txt|图|画|视频|文本|聊天)(?=\s|$)/i;
+// 意图正则一律锚定句首（允许「请/帮我/给我」等礼貌前缀）：
+//   这样「怎么画图」「如何生成视频」这类说明性提问不会被误判为生成指令。
+// 媒体名词必须紧跟在动词之后（窗口 14 字符），避免「生成一个包含视频播放功能的网页」被误判。
+const INTENT_POLITE = '^(?:请|帮我|帮忙|麻烦|给我|我要|我想|能|可以)?\\s*';
+const INTENT_IMAGE_RE = new RegExp(
+  INTENT_POLITE + '(?:生成|做|出|制作|设计|来)[^。！？!?\\n]{0,14}?(?:图|图片|插画|插图|海报|logo|图标|封面|头像|壁纸|表情包)'
+  + '|' + INTENT_POLITE + '(?:generate|create|make)\\s+(?:me\\s+)?(?:an?\\s+)?(?:image|picture|photo|poster|illustration|logo|icon|avatar|wallpaper)', 'i');
+const INTENT_VIDEO_RE = new RegExp(
+  INTENT_POLITE + '(?:生成|做|出|制作|拍|来)[^。！？!?\\n]{0,14}?(?:视频|动画|短片|动效|小视频)'
+  + '|' + INTENT_POLITE + '(?:generate|make|create|animate)\\s+(?:me\\s+)?(?:an?\\s+)?(?:video|clip|animation)', 'i');
+// 强图片动词：画 / 绘制 / 渲染 / draw / paint（画(?!面|质|风|法|笔|家|廊|像|布) 排除「画面/画质/画风」等名词）
+const INTENT_DRAW_RE = new RegExp(
+  INTENT_POLITE + '(?:绘画|绘制|画(?!面|质|风|法|笔|家|廊|像|布)|渲染|sketch|draw|paint)(?![a-z])', 'i');
+// 技术/代码语境一律不当成生成指令（如「生成一段调用视频接口的代码」）
+const INTENT_CODE_RE = /(代码|源码|脚本|函数|接口|api|html|css|javascript|正则|sql|报错|bug)/i;
+
+/** 意图识别：返回 'chat' | 'image' | 'video' */
+function detectIntent(text) {
+  const t = String(text || '').trim();
+  const cmd = INTENT_COMMAND_RE.exec(t);
+  if (cmd) {
+    const k = cmd[1].toLowerCase();
+    if (['img', 'image', 'draw', '图', '画'].includes(k)) return 'image';
+    if (['video', 'vid', '视频'].includes(k)) return 'video';
+    return 'chat';
+  }
+  if (INTENT_CODE_RE.test(t)) return 'chat';
+  if (INTENT_IMAGE_RE.test(t)) return 'image';
+  if (INTENT_VIDEO_RE.test(t)) return 'video';
+  if (INTENT_DRAW_RE.test(t)) return 'image';
+  return 'chat';
+}
+
+/** 去掉显式指令前缀，得到真正要发送的提示词 */
+function stripIntentCommand(text) {
+  return String(text || '').replace(INTENT_COMMAND_RE, '').replace(/^\s+/, '');
+}
+
+/** 某供应商内某能力的槽位模型（白名单过滤后判定；无配置回落该能力首个模型） */
+function providerCapabilityModel(p, kind) {
+  const all = p?.cachedModels || [];
+  const allow = p?.allowedModels || [];
+  const models = allow.length ? all.filter(m => allow.includes(m.id)) : all;
+  const typeOf = (id) => (p?.modelTypeOverrides || {})[id] || classifyModel(id);
+  const configured = (p?.capabilityModels || {})[kind] || '';
+  if (configured && models.some(m => m.id === configured) && typeOf(configured) === kind) return configured;
+  const fb = models.find(m => typeOf(m.id) === kind);
+  return fb ? fb.id : '';
+}
+
+/** 取当前供应商某能力的槽位模型（用于下拉展示与自动模式预览） */
+function capabilityModel(kind) {
+  return providerCapabilityModel(curProvider(), kind);
+}
+
+/* ---------------- 供应商健康标记（跨供应商失败转移的记忆） ----------------
+ * 某家供应商刚失败过 → 短时间内自动路由跳过它，省一次注定失败的等待。
+ * 冷却时长按失败类别分级：
+ *   rate    429 / 配额耗尽（商汤 Token Plan 是「每模型每 5h 1500 次」的窗口配额，429 后
+ *           短期重试没有意义，Agnes 是 RPM 限流）→ 90s
+ *   server  5xx 重试耗尽 / 网络失败 → 30s（多为瞬时抖动，恢复快）
+ * 成功一次即清除标记。运行时内存态，不持久化 —— 扩展重开即重置，保守无害。 */
+const PROVIDER_COOLDOWN_MS = { rate: 90 * 1000, server: 30 * 1000, network: 30 * 1000, other: 30 * 1000 };
+const _providerHealth = {};  // providerId → { until, reason }
+
+/** 从错误对象推断失败类别：优先读 requestWithRotation 打上的 e.kind 标记，消息内容兜底 */
+function errKind(e) {
+  if (e && e.kind) return e.kind;
+  const msg = (e && e.message) || '';
+  if (/429|限流|不可用/.test(msg)) return 'rate';
+  if (/5\d\d|服务端|网络/.test(msg)) return 'server';
+  return 'other';
+}
+function markProviderFailed(providerId, e) {
+  const kind = errKind(e);
+  _providerHealth[providerId] = { until: Date.now() + (PROVIDER_COOLDOWN_MS[kind] || PROVIDER_COOLDOWN_MS.other), reason: kind };
+}
+function markProviderOk(providerId) { delete _providerHealth[providerId]; }
+/** 该供应商剩余冷却毫秒数（0 = 未在冷却） */
+function providerCooling(providerId) {
+  const h = _providerHealth[providerId];
+  if (!h) return 0;
+  if (h.until <= Date.now()) { delete _providerHealth[providerId]; return 0; }
+  return h.until - Date.now();
+}
+
+/**
+ * 跨供应商收集某能力的可用候选（按序尝试，成功即止）：
+ *   当前供应商优先，其余按供应商列表顺序；只纳入「已配可用 Key 且具备该能力」的供应商。
+ *   冷却中的供应商排到最后（候选非空则直接跳过；全冷却时仍兜底参与，宁可再试不放弃）。
+ * 返回 [{ providerId, providerName, model }]
+ */
+function capabilityCandidates(kind) {
+  const list = settings.providers || [];
+  const cur = curProvider();
+  const ordered = cur ? [cur, ...list.filter(p => p.id !== cur.id)] : list.slice();
+  const fresh = [], cooling = [];
+  for (const p of ordered) {
+    if (!(p.keys || []).some(isKeyUsable)) continue;      // 没有可用 Key 的供应商不参与
+    if (kind === 'video' && !p.videoEnabled) continue;    // 视频需该供应商显式开启
+    const model = providerCapabilityModel(p, kind);
+    if (!model) continue;
+    const entry = { providerId: p.id, providerName: p.name, model };
+    (providerCooling(p.id) > 0 ? cooling : fresh).push(entry);
+  }
+  return fresh.concat(cooling);   // 冷却中的排到最后：只有前面的都失败才轮到它（兜底仍参与）
+}
+
+/**
+ * 自动路由决策：返回 { kind, candidates, prompt, degraded? }
+ * candidates 是跨供应商候选序列（当前供应商优先）；所有供应商都不具备该能力时降级为文本。
+ */
+function resolveRoute(rawText) {
+  const prompt = stripIntentCommand(rawText).trim() || String(rawText || '').trim();
+  const want = detectIntent(rawText);
+  const cands = capabilityCandidates(want);
+  if (!cands.length) {
+    return { kind: 'chat', candidates: capabilityCandidates('chat'), prompt, degraded: want };
+  }
+  return { kind: want, candidates: cands, prompt };
+}
+
+/** 降级提示文案（仅当所有已配置供应商都不具备该能力时才会走到） */
+function degradeTip(degraded) {
+  const name = degraded === 'video' ? '视频生成' : '图片生成';
+  return `所有已配置的供应商都没有可用的${name}能力，已按文本处理（视频需 Agnes 这类供应商，并在设置中开启）`;
+}
+
+/**
+ * 本次视频任务「实际由哪家供应商执行」。
+ * 视频开关（videoEnabled）与 1RPM 冷却（lastVideoTs）都是供应商级字段，
+ * 自动路由可能落到别家（当前在商汤、视频交给 Agnes），
+ * 读当前供应商会误拦（开关为 false）或漏拦（时间戳恒为 0）。
+ */
+function videoTargetProvider(autoRoute) {
+  if (autoRoute) {
+    const id = autoRoute.candidates[0]?.providerId;
+    const p = (settings.providers || []).find(x => x.id === id);
+    if (p) return p;
+  }
+  return curProvider();
+}
+
+/**
+ * 在指定供应商的配置下执行异步任务：
+ * 执行期间把该供应商投影到顶层（请求层零改动、Key 快照正确、限流按目标供应商记账），
+ * 结束后恢复为进入前的供应商投影；若任务期间用户切换过供应商，以其切换后的为准。
+ */
+async function runUnderProvider(providerId, fn) {
+  const list = settings.providers || [];
+  const target = list.find(p => p.id === providerId);
+  if (!target) return fn();
+  const wasCurrent = settings.currentProviderId === target.id;
+  const origId = settings.currentProviderId;   // 进入前的当前供应商（projectProvider 会改写它，必须先记）
+  if (!wasCurrent) {
+    absorbProvider();        // 先把顶层未落盘的改动写回原供应商，避免丢失
+    projectProvider(target); // 再投影目标供应商
+  }
+  try {
+    return await fn();
+  } finally {
+    if (!wasCurrent) {
+      // currentProviderId 若已被挪到 target 之外，说明任务期间用户切换过供应商，以其为准
+      const switched = settings.currentProviderId && settings.currentProviderId !== target.id;
+      const restoreTo = switched
+        ? (list.find(p => p.id === settings.currentProviderId) || target)
+        : (list.find(p => p.id === origId) || target);
+      projectProvider(restoreTo);
+      saveSettings();
+    }
+  }
+}
+
+/** 按候选顺序跨供应商执行，失败自动切换下一个；全部失败则抛出最后一次错误（由调用方统一落错误气泡） */
+async function runWithFailover(candidates, kind, prompt, signal) {
+  let lastErr = null;
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    try {
+      const out = await runUnderProvider(c.providerId, async () => {
+        if (kind === 'image') return await doImageGeneration(prompt, signal, c.model, { throwOnFail: true });
+        else if (kind === 'video') return await doVideoGeneration(prompt, signal, c.model, { throwOnFail: true });
+        else return await doChat(prompt, signal, c.model, { throwOnFail: true });
+      });
+      markProviderOk(c.providerId);   // 成功即清除健康标记
+      return out;
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;   // 用户主动停止：不再换供应商
+      markProviderFailed(c.providerId, e);    // 失败打标：短时间内自动路由跳过该供应商
+      lastErr = e;
+      const next = candidates[i + 1];
+      if (next) toast(`「${c.providerName}」生成失败，改用「${next.providerName}」重试…`);
+    }
+  }
+  throw lastErr || new Error('所有供应商均生成失败');
+}
+
 /* 模型类型识别关键词（小写匹配） */
 const IMAGE_KEYWORDS = ['image', 'u1-fast', 'draw', 'diffusion', 'dall', 'flux', 'seedream', 'sdxl', 'sd3', 'stable-diffusion', 'picture', 'agnes-image'];
 // 视频/多模态生成模型（如 Google veo、gemini-image 等），既非对话也非本扩展支持的图片接口，发送前拦截
@@ -102,6 +396,15 @@ const MAX_IMAGE_COUNT = 20;                   // 最多缓存 20 张图
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;     // 图片缓存总量上限 10MB
 const MAX_VIDEO_COUNT = 10;                   // 最多缓存 10 段视频
 const MAX_VIDEO_BYTES = 300 * 1024 * 1024;    // 视频缓存总量上限 300MB
+const VIDEO_MODEL_SIZE = '720P';              // Agnes 视频 2.5-flash 仅支持 720P（传其他值必 400）
+const SERVER_ERR_BACKOFF_MS = [2000, 6000, 15000]; // 5xx 服务端抖动重试计划（官方建议指数退避）
+
+/* Agnes 免费 / default Key 的「实际可执行 RPM」（官方 Token Plan FAQ 2026-09-23 更新版）
+ * 文本 10（官方 2026-09-23 起由 20 下调 50%）；图片 1K=20 / 2K=10 / 3K=1 / 4K=1；视频 1（账号级）。
+ * 官方明确「同类型 Key 共享同一限制池」（两把免费 Key 共用同一个 free/default 池），
+ * 多把免费 Key 不会放大 RPM —— acquireRate 不按 Key 数放大。仅对 Agnes 供应商生效。 */
+const AGNES_RPM = { chat: 10, video: 1, image: { '1K': 20, '2K': 10, '3K': 1, '4K': 1 } };
+const _rateLastTs = {};                       // 限流桶 → 上次发起时间戳
 const COOLDOWN_429_MS = 60 * 1000;            // 429 限流冷却 60s
 const COOLDOWN_401_MS = 10 * 60 * 1000;       // 401 鉴权失败冷却 10min
 const BACKOFF_BASE_MS = 2000;                 // 指数退避基准 2s
@@ -210,6 +513,11 @@ function makeProvider(preset = {}) {
     noStreamModels: {},
     cachedModels: [],
     imageConfig: { ...JSON.parse(JSON.stringify(DEFAULTS.imageConfig)) },
+    videoConfig: { ...JSON.parse(JSON.stringify(DEFAULTS.videoConfig)) },
+    videoEnabled: !!preset.videoEnabled,
+    lastVideoTs: 0,
+    allowedModels: Array.isArray(preset.allowedModels) ? preset.allowedModels.slice() : [],
+    capabilityModels: { ...DEFAULTS.capabilityModels, ...(preset.capabilityModels || {}) },
     lastModel: ''
   };
 }
@@ -223,6 +531,7 @@ function normEndpoint(v, def, allowEmpty) {
 /** 规范化一个已持久化的供应商对象（兼容缺字段/旧结构） */
 function normalizeProvider(p, idx) {
   const baseUrl = String(p.baseUrl || '').trim().replace(/\/+$/, '');
+  const isAgnes = (p.name || '').toString().toLowerCase().includes('agnes');
   return {
     id: p.id || 'prov_' + (idx + 1) + '_' + uid(),
     name: (p.name || '供应商 ' + (idx + 1)).toString().slice(0, 30),
@@ -242,6 +551,14 @@ function normalizeProvider(p, idx) {
     noStreamModels: p.noStreamModels || {},
     cachedModels: Array.isArray(p.cachedModels) ? p.cachedModels : [],
     imageConfig: { ...DEFAULTS.imageConfig, ...(p.imageConfig || {}) },
+    videoConfig: { ...DEFAULTS.videoConfig, ...(p.videoConfig || {}) },
+    videoEnabled: p.videoEnabled ?? isAgnes,
+    lastVideoTs: p.lastVideoTs || 0,
+    // 白名单：显式配置优先；未配置时若为 Agnes，默认限制在免费模型内（避免误选收费模型）
+    allowedModels: Array.isArray(p.allowedModels) && p.allowedModels.length
+      ? p.allowedModels.slice()
+      : (isAgnes ? AGNES_FREE_MODELS.slice() : []),
+    capabilityModels: { ...DEFAULTS.capabilityModels, ...(isAgnes ? AGNES_DEFAULT_SLOTS : {}), ...(p.capabilityModels || {}) },
     lastModel: p.lastModel || ''
   };
 }
@@ -259,8 +576,11 @@ function projectProvider(p) {
   settings.noStreamModels = p.noStreamModels;
   settings.lastModel = p.lastModel || '';
   settings.imageConfig = p.imageConfig;
+  settings.videoConfig = p.videoConfig;
   settings.videoEnabled = p.videoEnabled ?? false;
   settings.lastVideoTs = p.lastVideoTs || 0;
+  settings.allowedModels = p.allowedModels || [];
+  settings.capabilityModels = p.capabilityModels || { ...DEFAULTS.capabilityModels };
   cachedModels = p.cachedModels || [];
 }
 
@@ -277,8 +597,11 @@ function absorbProvider() {
   p.noStreamModels = settings.noStreamModels;
   p.lastModel = settings.lastModel || '';
   p.imageConfig = settings.imageConfig;
+  p.videoConfig = settings.videoConfig;
   p.videoEnabled = settings.videoEnabled;
   p.lastVideoTs = settings.lastVideoTs;
+  p.allowedModels = settings.allowedModels;
+  p.capabilityModels = settings.capabilityModels;
   p.cachedModels = cachedModels;
 }
 
@@ -388,6 +711,11 @@ async function loadAll() {
   settings = { ...JSON.parse(JSON.stringify(DEFAULTS)), ...(data.settings || {}) };
   settings.imageConfig = { ...DEFAULTS.imageConfig, ...(settings.imageConfig || {}) };
   settings.imageConfig.size = normalizeImageSize(settings.imageConfig.size); // 迁移旧版非法尺寸（如 1024x1024）
+  settings.videoConfig = { ...DEFAULTS.videoConfig, ...(settings.videoConfig || {}) };
+  settings.videoConfig.seconds = normalizeVideoSeconds(settings.videoConfig.seconds);
+  settings.videoConfig.aspectRatio = normalizeVideoRatio(settings.videoConfig.aspectRatio);
+  settings.imageConfig.tier = normalizeImgTier(settings.imageConfig.tier);
+  settings.imageConfig.ratio = normalizeImgRatio(settings.imageConfig.ratio);
   settings.modelTypeOverrides = settings.modelTypeOverrides || {};
   settings.streamOutput = settings.streamOutput !== false;
   settings.noStreamModels = settings.noStreamModels || {};
@@ -500,7 +828,9 @@ function applySessionUI() {
   const s = curSession();
   if (!s) return;
   // 模型：优先用会话记忆的模型；已失效（模型列表变化）则回退并写回
-  if (s.model && cachedModels.some(m => m.id === s.model)) {
+  if (s.model === AUTO_MODEL_ID) {
+    selectedModel = AUTO_MODEL_ID;
+  } else if (s.model && visibleModels().some(m => m.id === s.model)) {
     selectedModel = s.model;
   } else {
     selectedModel = null;
@@ -760,10 +1090,15 @@ async function fetchModels(auto = false) {
     cachedModels = [...new Set(list)].map(id => ({ id, type: classifyModel(id) }));
     await saveSettings();               // 写回当前供应商并持久化
     renderModelDropdown();
+    renderAutoRouteUI();                // 槽位下拉随模型列表刷新
     autoSelectModel();
     syncSessionModel();   // 模型列表刷新后，把生效模型写回当前会话
-    const nImg = cachedModels.filter(m => getEffectiveType(m.id) === 'image').length;
-    toast(`已获取 ${cachedModels.length} 个模型（文本 ${cachedModels.length - nImg} / 绘图 ${nImg}）`, 'success');
+    const vis = visibleModels();
+    const nImg = vis.filter(m => getEffectiveType(m.id) === 'image').length;
+    const nVid = vis.filter(m => getEffectiveType(m.id) === 'video').length;
+    const hidden = cachedModels.length - vis.length;
+    toast(`已获取 ${cachedModels.length} 个模型 → 可用 ${vis.length}（文本 ${vis.length - nImg - nVid} / 绘图 ${nImg} / 视频 ${nVid}）`
+      + (hidden ? `，白名单隐藏 ${hidden} 个` : ''), 'success');
   } catch (e) {
     if (!auto) toast('拉取模型失败：' + e.message, 'error');
   } finally {
@@ -772,14 +1107,18 @@ async function fetchModels(auto = false) {
 }
 
 function autoSelectModel() {
-  if (!cachedModels.length) { selectedModel = null; updateModelButton(); updateComposerMode(); return; }
-  if (selectedModel && cachedModels.some(m => m.id === selectedModel)) return;
+  const all = visibleModels();
+  if (!all.length) { selectedModel = null; updateModelButton(); updateComposerMode(); return; }
+  if (selectedModel === AUTO_MODEL_ID) { updateModelButton(); updateComposerMode(); return; }
+  if (selectedModel && all.some(m => m.id === selectedModel)) return;
   const last = settings.lastModel;
-  if (last && cachedModels.some(m => m.id === last)) {
+  if (last === AUTO_MODEL_ID) {
+    selectedModel = AUTO_MODEL_ID;
+  } else if (last && all.some(m => m.id === last)) {
     selectedModel = last;
   } else {
-    const firstChat = cachedModels.find(m => getEffectiveType(m.id) === 'chat');
-    selectedModel = (firstChat || cachedModels[0]).id;
+    const firstChat = all.find(m => getEffectiveType(m.id) === 'chat');
+    selectedModel = (firstChat || all[0]).id;
   }
   updateModelButton();
   updateComposerMode();
@@ -843,7 +1182,7 @@ async function readApiError(res) {
  *     · 多 Key：退避 2s→4s（共 2 轮）
  * - 全部为 401 → 直接报错（等待无意义）
  */
-async function requestWithRotation(url, init, { onNotice, signal, userSignal } = {}) {
+async function requestWithRotation(url, init, { onNotice, signal, userSignal, onKeyUsed } = {}) {
   // 关键：锁定发起请求时的 Key 快照。
   // 多供应商场景下，生成中切换会话会跟随切换供应商（projectProvider 替换 settings.keys），
   // 若每次重试实时读 settings.keys，会拿 B 供应商的 Key 打 A 供应商的 URL → 必然 401 →
@@ -860,7 +1199,11 @@ async function requestWithRotation(url, init, { onNotice, signal, userSignal } =
   const single = keys.length <= 1;
   const backoffRounds = single ? SINGLE_KEY_BACKOFF_MS.length : MAX_BACKOFF_ROUNDS;
 
-  for (let round = 0; round <= backoffRounds; round++) {
+  let round = 0;              // 429 轮级退避计数
+  let serverRetry = 0;        // 5xx 服务端抖动重试计数
+  let lastServerErr = '';     // 最近一次 5xx 的错误详情
+
+  while (true) {
     if (round > 0) {
       const has429 = keys.some(k => k.coolReason === '429');
       if (!has429) break; // 全部 401，等待无意义
@@ -870,6 +1213,7 @@ async function requestWithRotation(url, init, { onNotice, signal, userSignal } =
       keys.forEach(k => { if (k.coolReason === '429') { k.coolingUntil = 0; k.status = 'active'; } });
     }
 
+    let saw5xx = false;
     // 每轮最多尝试 Key 总数次（单 Key 即：每轮试 1 次）
     for (let attempt = 0; attempt < keys.length; attempt++) {
       const key = pickNextKey(keys);
@@ -890,7 +1234,9 @@ async function requestWithRotation(url, init, { onNotice, signal, userSignal } =
           if (userSignal?.aborted) throw abortError(); // 用户主动停止
           throw e; // 内部超时中断，交由上层分类处理
         }
-        throw new Error('网络请求失败：' + (e.message || '无法连接服务器，请检查 Base URL / 网络'));
+        const ne = new Error('网络请求失败：' + (e.message || '无法连接服务器，请检查 Base URL / 网络'));
+        ne.kind = 'network';  // 供供应商健康标记分级冷却（网络类 30s）
+        throw ne;
       }
 
       if (res.status === 429 || res.status === 401) {
@@ -911,6 +1257,13 @@ async function requestWithRotation(url, init, { onNotice, signal, userSignal } =
         continue; // 静默换 Key 重试
       }
 
+      // 5xx（500/502/503/520）：服务端抖动，官方建议指数退避后重试
+      if (res.status >= 500 && res.status < 600) {
+        lastServerErr = await readApiError(res);
+        saw5xx = true;
+        continue; // 继续尝试其它 Key；全部失败则本轮结束后统一退避
+      }
+
       if (!res.ok) throw await readApiError(res);
 
       // 成功：恢复 Key 状态（含清除冷却原因，避免残留影响后续判断）
@@ -920,21 +1273,44 @@ async function requestWithRotation(url, init, { onNotice, signal, userSignal } =
       key.coolReason = '';
       renderKeyStatus();
       saveSettings();
+      if (onKeyUsed) onKeyUsed(key); // 供视频轮询复用「创建任务时」的同一个 Key
       return res;
     }
+
+    // 本轮只遇到 5xx：按指数退避后再来一轮（不消耗 429 轮次预算）
+    if (saw5xx && serverRetry < SERVER_ERR_BACKOFF_MS.length) {
+      const wait = SERVER_ERR_BACKOFF_MS[serverRetry];
+      serverRetry++;
+      if (onNotice) onNotice(`⚠️ 服务端返回异常，${Math.round(wait / 1000)}s 后自动重试（第 ${serverRetry}/${SERVER_ERR_BACKOFF_MS.length} 次）…`);
+      await abortableSleep(wait, signal);
+      continue;
+    }
+
+    round++;
+    if (round > backoffRounds) break;
   }
 
   const has429 = keys.some(k => k.coolReason === '429');
   const has401 = keys.some(k => k.coolReason === '401');
-  let msg = '所有 Key 均不可用，请稍后再试';
-  if (has429 && has401) msg = '所有 Key 均处于限流(429)/鉴权失败(401)状态，请检查 Key 或稍后再试';
-  else if (has429) msg = keys.length === 1
-    ? '当前 Key 持续被限流(429)，已自动退避重试多次仍失败，请稍后再试或补充更多 Key'
-    : '所有 Key 均被限流(429)，已按指数退避自动重试仍失败，请稍后再试';
-  else if (has401) msg = '所有 Key 鉴权失败(401)，请检查 Key 是否正确或已过期';
-  const err = new Error(msg);
-  if (has429) err.code = 'rate_limited'; // 上层据此尝试关闭流式降级重试
-  throw err;
+  if (has429 || has401) {
+    let msg = '所有 Key 均不可用，请稍后再试';
+    if (has429 && has401) msg = '所有 Key 均处于限流(429)/鉴权失败(401)状态，请检查 Key 或稍后再试';
+    else if (has429) msg = keys.length === 1
+      ? '当前 Key 持续被限流(429)，已自动退避重试多次仍失败，请稍后再试或补充更多 Key'
+      : '所有 Key 均被限流(429)，已按指数退避自动重试仍失败，请稍后再试';
+    else if (has401) msg = '所有 Key 鉴权失败(401)，请检查 Key 是否正确或已过期';
+    const err = new Error(msg);
+    if (has429) err.code = 'rate_limited'; // 上层据此尝试关闭流式降级重试
+    throw err;
+  }
+  if (lastServerErr) {
+    const se = new Error(lastServerErr + `（服务端连续异常，已按指数退避自动重试 ${serverRetry} 次）`);
+    se.kind = 'server';   // 供供应商健康标记分级冷却（服务端类 30s）
+    throw se;
+  }
+  const ke = new Error('所有 Key 均不可用，请稍后再试');
+  ke.kind = 'rate';       // 走到这里 = 429/401 轮级退避也耗尽 → 按限流/配额类冷却 90s
+  throw ke;
 }
 
 /* ---------------- 聊天（流式 SSE） ---------------- */
@@ -1263,6 +1639,8 @@ async function streamChat(model, messages, { onDelta, onNotice, onReasoning, sig
   const combined = linkedAbortSignal(signal, guard.signal);
 
   try {
+    // 免费额度限流：文本模型按官方实测 RPM 排队（多 Key 分摊），避免连发触发 429
+    await acquireRate('chat', null, onNotice, combined);
     const res = await requestWithRotation(joinUrl(settings.baseUrl, settings.chatEndpoint), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1342,7 +1720,7 @@ async function fetchImageAsBase64(url) {
   return await blobToBase64(blob);
 }
 
-async function doImageGeneration(prompt, signal) {
+async function doImageGeneration(prompt, signal, model = selectedModel, opts = {}) {
   const sid = currentSessionId;
   const sess = sessions.find(s => s.id === sid);
   if (!sess) return;
@@ -1351,7 +1729,7 @@ async function doImageGeneration(prompt, signal) {
   const elOf = () => document.querySelector(`#messages [data-id="${msg.id}"]`);
 
   const msg = {
-    id: uid(), ts: Date.now(), model: selectedModel, modelType: 'image',
+    id: uid(), ts: Date.now(), model, modelType: 'image',
     role: 'assistant', type: 'image', content: '', prompt,
     pending: true, cached: false
   };
@@ -1370,10 +1748,17 @@ async function doImageGeneration(prompt, signal) {
       throw new Error('当前供应商「' + (curProvider()?.name || '') + '」没有绘图能力，请切换到支持绘图（如商汤）的供应商，或在该供应商设置中填写绘图端点。');
     }
     // 按供应商组装请求体：Agnes 用档位+比例，其他供应商用精确像素尺寸
-    const isAgnes = (curProvider()?.name || '').toLowerCase().includes('agnes');
+    const isAgnes = isAgnesProvider();
     const body = isAgnes
-      ? { model: selectedModel, prompt, size: settings.imageConfig.tier || '2K', ratio: settings.imageConfig.ratio || '16:9' }
-      : { model: selectedModel, prompt, size: normalizeImageSize(settings.imageConfig.size), watermark: !!settings.imageConfig.watermark };
+      ? {
+          model, prompt,
+          size: normalizeImgTier(settings.imageConfig.tier),
+          ratio: normalizeImgRatio(settings.imageConfig.ratio),
+          extra_body: { response_format: 'url' } // 官方要求放在 extra_body 内，顶层会被忽略
+        }
+      : { model, prompt, size: normalizeImageSize(settings.imageConfig.size), watermark: !!settings.imageConfig.watermark };
+    // 免费额度限流：图片按所选档位的实测 RPM 排队（3K/4K 仅 1/分钟）
+    await acquireRate('image', settings.imageConfig.tier, notice, signal);
     const res = await requestWithRotation(joinUrl(settings.baseUrl, settings.imageEndpoint), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1412,6 +1797,7 @@ async function doImageGeneration(prompt, signal) {
     if (e.name === 'AbortError') {
       toast('已停止绘图');
     } else {
+      if (opts?.throwOnFail) throw e; // 自动路由的跨供应商失败切换：由上层统一落错误气泡
       pushError('绘图失败：' + e.message, e.needSettings, msgs, sid);
     }
   }
@@ -1435,7 +1821,7 @@ async function enforceImageLimitsAndSave(msgs = chatHistory) {
 }
 
 /** 视频生成：创建任务 + 轮询结果 + Base64 缓存 */
-async function doVideoGeneration(prompt, signal) {
+async function doVideoGeneration(prompt, signal, model = selectedModel, opts = {}) {
   const sid = currentSessionId;
   const sess = sessions.find(s => s.id === sid);
   if (!sess) return;
@@ -1444,7 +1830,7 @@ async function doVideoGeneration(prompt, signal) {
   const elOf = () => document.querySelector(`#messages [data-id="${msg.id}"]`);
 
   const msg = {
-    id: uid(), ts: Date.now(), model: selectedModel, modelType: 'video',
+    id: uid(), ts: Date.now(), model, modelType: 'video',
     role: 'assistant', type: 'video', content: '', prompt,
     pending: true, cached: false
   };
@@ -1467,27 +1853,25 @@ async function doVideoGeneration(prompt, signal) {
     await saveSettings();
 
     notice('🎬 正在创建视频生成任务…');
-    // 1. 创建任务：POST /v1/videos
+    // 1. 创建任务：POST {baseUrl}/videos
+    //    锁定「创建时使用的那把 Key」，后续轮询复用同一 Key（跨 Key 可能查不到他人账号下的任务）
+    let createdAuth = '';
     const createRes = await requestWithRotation(joinUrl(settings.baseUrl, '/videos'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: selectedModel,
-        prompt,
-        seconds: '4',  // 官方要求必须字符串
-        size: settings.imageConfig.tier || '2K',
-        ratio: settings.imageConfig.ratio || '16:9'
-      })
-    }, { onNotice: notice, signal });
+      body: JSON.stringify(buildVideoBody(model, prompt))
+    }, { onNotice: notice, signal, onKeyUsed: (k) => { createdAuth = authValue(k); } });
 
     const createData = await createRes.json().catch(() => null);
     if (createData?.error) throw new Error(createData.error.message || '创建视频任务失败');
     const videoId = createData?.video_id || createData?.id;
     if (!videoId) throw new Error('接口未返回 video_id');
 
-    // 2. 轮询结果：GET /agnesapi?video_id=<id>（前快后慢，总上限 5min）
+    // 2. 轮询结果：GET {origin}/agnesapi?video_id=<id>&model_name=<model>
+    //    域名由供应商 baseUrl 推导（兼容国内站 / 自建网关）；必须带 Authorization
     notice('⏳ 视频生成中，正在轮询结果…');
-    const pollUrl = `https://apihub.agnes-ai.com/agnesapi?video_id=${encodeURIComponent(videoId)}`;
+    const pollUrl = buildVideoPollUrl(videoId, model);
+    const pollHeaders = createdAuth ? { 'Authorization': createdAuth } : {};
     const maxPollMs = 5 * 60 * 1000;
     const startTs = Date.now();
     // 首 30s 每 2s 查询（尽快感知结果），之后每 30s 步进 1s，封顶 5s——长任务又不至于请求过密
@@ -1499,23 +1883,30 @@ async function doVideoGeneration(prompt, signal) {
       await abortableSleep(pollIntervalMs(), signal);
       notice(`⏳ 视频生成中… 已等待 ${Math.floor((Date.now() - startTs) / 1000)}s`);
       try {
-        const pollRes = await fetch(pollUrl, { method: 'GET' });
+        const pollRes = await fetch(pollUrl, { method: 'GET', headers: pollHeaders });
         if (!pollRes.ok) continue;
         const pollData = await pollRes.json();
-        if (pollData.status === 'success' || pollData.status === 'completed') {
-          videoUrl = pollData.video_url || pollData.url;
-          break;
-        } else if (pollData.status === 'failed') {
-          throw new Error(pollData.error || '视频生成失败');
+        const status = String(pollData?.status || pollData?.state || '').toLowerCase();
+        if (['completed', 'succeeded', 'success', 'done'].includes(status)) {
+          // 官方 2.5 系列把成品地址放在 metadata.url；兼容其它可能的字段名
+          videoUrl = pollData?.metadata?.url || pollData?.output?.url || pollData?.video_url || pollData?.url;
+          if (videoUrl) break;
+        } else if (['failed', 'error', 'canceled', 'cancelled'].includes(status)) {
+          const raw = pollData?.error;
+          const detail = (typeof raw === 'string' ? raw : raw?.message) || pollData?.message;
+          const fe = new Error(detail || '视频生成失败');
+          fe.videoFailed = true; // 业务失败：标记后上抛，避免被下面的网络异常分支吞掉
+          throw fe;
         }
-        // status === 'processing' 或未知 → 继续轮询
+        // 其它状态（queued / processing / 未知）→ 继续轮询
       } catch (e) {
         if (e.name === 'AbortError') throw e;
+        if (e.videoFailed) throw e;           // 业务失败：直接上抛
         // 网络错误等 → 继续轮询
       }
     }
 
-    if (!videoUrl) throw new Error('视频生成超时（5 分钟）');
+    if (!videoUrl) throw new Error('视频生成超时（5 分钟），任务可能仍在排队，可稍后重试');
 
     // 3. 下载视频 → Base64 缓存
     notice('📥 正在下载视频并缓存到本地…');
@@ -1539,6 +1930,7 @@ async function doVideoGeneration(prompt, signal) {
     if (e.name === 'AbortError') {
       toast('已停止视频生成');
     } else {
+      if (opts?.throwOnFail) throw e; // 自动路由的跨供应商失败切换：由上层统一落错误气泡
       pushError('视频生成失败：' + e.message, e.needSettings, msgs, sid);
     }
   }
@@ -1585,8 +1977,8 @@ async function handleSend() {
     return;
   }
   const inputEl = $('#input');
-  const text = inputEl.value.trim();
-  if (!text) return;
+  const rawText = inputEl.value.trim();
+  if (!rawText) return;
 
   if (!settings.keys.length) {
     toast('请先在设置中配置 API Key', 'error');
@@ -1599,15 +1991,36 @@ async function handleSend() {
     return;
   }
 
-  const modelType = getEffectiveType(selectedModel);
-  // 视频模型：videoEnabled 时放行，否则拦截提示
-  if (modelType === 'video' && !settings.videoEnabled) {
-    toast(`「${selectedModel}」是视频生成模型，当前供应商未启用视频能力，请在设置中开启或切换供应商`, 'error');
+  /* 分流：普通模型按所选类型（当前供应商内）；「⚡ 自动」按意图跨供应商路由 */
+  let text = rawText;
+  let modelType, useModel;
+  let autoRoute = null;
+  if (selectedModel === AUTO_MODEL_ID) {
+    autoRoute = resolveRoute(rawText);
+    if (!autoRoute.candidates.length) {
+      toast('自动模式下没有可用模型：请先 ⟳ 拉取模型列表，并在需要的供应商里配置 API Key', 'error');
+      return;
+    }
+    if (autoRoute.degraded) toast(degradeTip(autoRoute.degraded), 'error');
+    text = autoRoute.prompt;
+    modelType = autoRoute.kind;
+    useModel = autoRoute.candidates[0].model;
+  } else {
+    modelType = getEffectiveType(selectedModel);
+    useModel = selectedModel;
+  }
+
+  // 视频守卫与冷却都以「实际执行该视频任务的供应商」为准（自动路由可能落到 Agnes 等）
+  const vidProvider = videoTargetProvider(autoRoute);
+  const vidEnabled = !!vidProvider?.videoEnabled;
+  if (modelType === 'video' && !vidEnabled) {
+    const who = vidProvider?.name ? `「${vidProvider.name}」` : '当前供应商';
+    toast(`「${useModel}」是视频生成模型，供应商${who}未启用视频能力，请在设置中开启`, 'error');
     return;
   }
-  // 视频 1RPM 冷却检查
-  if (modelType === 'video' && settings.videoEnabled) {
-    const elapsed = Date.now() - settings.lastVideoTs;
+  // 视频 1RPM 冷却检查（读目标供应商自己的时间戳，避免跨供应商时漏拦）
+  if (modelType === 'video' && vidEnabled) {
+    const elapsed = Date.now() - (vidProvider.lastVideoTs || 0);
     if (elapsed < 60000) {
       const remain = Math.ceil((60000 - elapsed) / 1000);
       toast(`⏱ 视频限频 1/分钟，距离下次可生成还需 ${remain}s`, 'error');
@@ -1622,7 +2035,7 @@ async function handleSend() {
 
   // 用户消息入历史并渲染
   const userMsg = {
-    id: uid(), ts: Date.now(), model: selectedModel, modelType,
+    id: uid(), ts: Date.now(), model: useModel, modelType,
     role: 'user', type: 'text', content: text
   };
   chatHistory.push(userMsg);
@@ -1640,13 +2053,19 @@ async function handleSend() {
   autoGrow(inputEl);
 
   try {
-    if (modelType === 'image') {
-      await doImageGeneration(text, ctrl.signal);
-    } else if (modelType === 'video' && settings.videoEnabled) {
-      await doVideoGeneration(text, ctrl.signal);
+    if (autoRoute) {
+      await runWithFailover(autoRoute.candidates, modelType, text, ctrl.signal);
+    } else if (modelType === 'image') {
+      await doImageGeneration(text, ctrl.signal, useModel);
+    } else if (modelType === 'video') {
+      // 视频能力已在上方守卫中按目标供应商校验通过，此处不再重复读当前供应商的开关
+      await doVideoGeneration(text, ctrl.signal, useModel);
     } else {
-      await doChat(text, ctrl.signal);
+      await doChat(text, ctrl.signal, useModel);
     }
+  } catch (e) {
+    // 仅自动路由的跨供应商全失败会走到这里（单个供应商内部的失败已在各自函数里落气泡）
+    if (e && e.name !== 'AbortError') pushError('生成失败：' + e.message, e.needSettings);
   } finally {
     generating.delete(sid);
     setSendState();
@@ -1654,7 +2073,7 @@ async function handleSend() {
   }
 }
 
-async function doChat(prompt, signal) {
+async function doChat(prompt, signal, model = selectedModel, opts = {}) {
   const sid = currentSessionId;
   const sess = sessions.find(s => s.id === sid);
   if (!sess) return;
@@ -1663,7 +2082,7 @@ async function doChat(prompt, signal) {
   const elOf = () => document.querySelector(`#messages [data-id="${msg.id}"]`);
 
   const msg = {
-    id: uid(), ts: Date.now(), model: selectedModel, modelType: 'chat',
+    id: uid(), ts: Date.now(), model, modelType: 'chat',
     role: 'assistant', type: 'text', content: '', pending: true
   };
   msgs.push(msg);                               // 先入列：切走再切回能看到生成中状态
@@ -1705,7 +2124,7 @@ async function doChat(prompt, signal) {
     if (el) { el.textContent = n; el.classList.add('show'); }
   };
 
-  const runOnce = (useStream) => streamChat(selectedModel, messages, {
+  const runOnce = (useStream) => streamChat(model, messages, {
     signal,
     stream: useStream,
     onDelta: (cur) => { msg.content = cur; paint(); },
@@ -1714,7 +2133,7 @@ async function doChat(prompt, signal) {
   });
 
   // 是否用流式：全局开关 + 该模型未被标记为"流式异常"
-  const wantStream = settings.streamOutput !== false && !settings.noStreamModels[selectedModel];
+  const wantStream = settings.streamOutput !== false && !settings.noStreamModels[model];
 
   // 生成中计时提示：首字/首 token 前显示已等待秒数，让用户知道模型在响应而非卡死
   const gStart = Date.now();
@@ -1734,16 +2153,16 @@ async function doChat(prompt, signal) {
       // 流式疑似引发问题时（限流/挂起/超时）→ 自动降级为非流式重试一次（与 curl 行为一致）
       const canFallback = wantStream && (e.idleTimeout || e.totalTimeout || e.code === 'rate_limited');
       if (!canFallback) throw e;
-      settings.noStreamModels[selectedModel] = true; // 记住该模型：后续请求直接走非流式
+      settings.noStreamModels[model] = true; // 记住该模型：后续请求直接走非流式
       saveSettings();
-      notice(`⚠️ ${selectedModel} 流式模式异常（${e.message}），已自动切换非流式重试，之后该模型将直接使用非流式`);
+      notice(`⚠️ ${model} 流式模式异常（${e.message}），已自动切换非流式重试，之后该模型将直接使用非流式`);
       msg.content = ''; msg._reasoning = ''; // 重置上次的部分输出
       try {
         full = await runOnce(false);
       } catch (e2) {
         // 非流式重试也失败（多为模型/网关本身不稳定或服务端挂起）：
         // 解除非流式锁，避免模型被"永久卡死"在这条坏路径上
-        if (settings.noStreamModels[selectedModel]) { delete settings.noStreamModels[selectedModel]; saveSettings(); }
+        if (settings.noStreamModels[model]) { delete settings.noStreamModels[model]; saveSettings(); }
         e2.lockReleased = true;
         throw e2;
       }
@@ -1776,6 +2195,7 @@ async function doChat(prompt, signal) {
     } else {
       const i = msgs.indexOf(msg); if (i > -1) msgs.splice(i, 1);
       if (isCur()) { const n = elOf(); if (n) n.remove(); }
+      if (opts?.throwOnFail) throw e; // 自动路由的跨供应商失败切换：由上层统一落错误气泡
       const hint = e.lockReleased
         ? `\n\n已解除该模型的非流式锁定。若该模型持续无响应，可能是模型或网关不稳定，请在模型列表点击「非流式 ↺」手动测试流式，或更换模型。`
         : `\n\n若模型无响应，可点击右侧模型名下的「非流式 ↺」手动切换流式/非流式再试。`;
@@ -2011,27 +2431,35 @@ function toggleDropdown(show) {
   }
 }
 
+/** 应用白名单过滤后的模型列表（白名单为空 = 不限制；Agnes 预设只留免费模型） */
+function visibleModels() {
+  const allow = settings.allowedModels || [];
+  if (!allow.length) return cachedModels;
+  return cachedModels.filter(m => allow.includes(m.id));
+}
+
 function renderModelDropdown() {
   const listEl = $('#modelList');
   if (!listEl) return;
 
-  if (!cachedModels.length) {
-    listEl.innerHTML = '<div class="md-empty">暂无模型，请先配置 Key 并点击 ⟳ 刷新</div>';
+  const all = visibleModels();
+  if (!all.length) {
+    const hidden = cachedModels.length - all.length;
+    listEl.innerHTML = '<div class="md-empty">暂无可用模型，请先配置 Key 并点击 ⟳ 刷新'
+      + (hidden > 0 ? `<br>（${hidden} 个模型被白名单隐藏，可在设置中调整）` : '') + '</div>';
     $('#mdCount').textContent = '';
     return;
   }
 
   const kw = mdFilterText.trim().toLowerCase();
   const chat = [], image = [], other = [];
-  cachedModels.forEach(m => {
+  all.forEach(m => {
     if (kw && !m.id.toLowerCase().includes(kw)) return;
     const t = getEffectiveType(m.id);
     if (t === 'video') other.push(m);
     else if (t === 'image') image.push(m);
     else chat.push(m);
   });
-
-  $('#mdCount').textContent = kw ? `${chat.length + image.length + other.length}/${cachedModels.length}` : `${cachedModels.length} 个`;
 
   const item = (m) => {
     const sel = m.id === selectedModel;
@@ -2051,11 +2479,38 @@ function renderModelDropdown() {
     </div>`;
   };
 
-  let html = '';
+  // ⚡ 自动：置顶展示（搜索关键词不相关时隐藏）
+  const autoHit = !kw || '自动'.includes(kw) || 'auto'.includes(kw) || AUTO_MODEL_ID.includes(kw);
+  let autoHtml = '';
+  if (autoHit) {
+    // 副标题展示「每个能力将实际使用的模型」；跨供应商的标注来源
+    const curId = curProvider()?.id;
+    const iconOf = { chat: '💬', image: '🎨', video: '🎬' };
+    const slots = ['chat', 'image', 'video'].map(k => {
+      const c = capabilityCandidates(k)[0];
+      if (!c) return '';
+      const cross = c.providerId !== curId ? `（${c.providerName}）` : '';
+      const cool = providerCooling(c.providerId);
+      const coolMark = cool > 0 ? `⏸冷却${Math.ceil(cool / 1000)}s` : '';
+      return `${iconOf[k]} ${c.model}${cross}${coolMark}`;
+    }).filter(Boolean);
+    const autoSel = selectedModel === AUTO_MODEL_ID;
+    autoHtml = `<div class="model-item md-auto${autoSel ? ' selected' : ''}" data-id="${AUTO_MODEL_ID}"
+      title="按输入自动判断：画图 → 图片模型；生成视频 → 视频模型；其余走文本">
+      <span class="type-toggle" style="pointer-events:none">⚡</span>
+      <span class="mi-name">自动（按意图路由）<span class="md-auto-sub">${escapeHtml(slots.join(' · ') || '未配置槽位，请到设置中选择')}</span></span>
+      ${autoSel ? '<span class="mi-check">✓</span>' : ''}
+    </div>`;
+  }
+
+  let html = autoHtml;
   if (chat.length) html += `<div class="md-group-title">💬 文本模型（${chat.length}）</div>` + chat.map(item).join('');
   if (image.length) html += `<div class="md-group-title">🎨 绘图模型（${image.length}）</div>` + image.map(item).join('');
   if (other.length) html += `<div class="md-group-title">🎬 视频模型（${other.length}）</div>` + other.map(item).join('');
   listEl.innerHTML = html || '<div class="md-empty">没有匹配的模型</div>';
+
+  const total = chat.length + image.length + other.length + (autoHit ? 1 : 0);
+  $('#mdCount').textContent = kw ? `${total}/${all.length}` : `${all.length} 个`;
 }
 
 function updateModelButton() {
@@ -2064,23 +2519,68 @@ function updateModelButton() {
     $('#modelBtnName').textContent = '选择模型';
     return;
   }
+  if (selectedModel === AUTO_MODEL_ID) {
+    $('#modelBtnIcon').textContent = '⚡';
+    $('#modelBtnName').textContent = '自动（按意图路由）';
+    return;
+  }
   const t = getEffectiveType(selectedModel);
-  $('#modelBtnIcon').textContent = t === 'image' ? '🎨' : '💬';
+  $('#modelBtnIcon').textContent = t === 'image' ? '🎨' : (t === 'video' ? '🎬' : '💬');
   $('#modelBtnName').textContent = selectedModel;
 }
 
+/** 自动模式下，按当前输入实时预判将要走的能力（跨供应商无可用候选时按文本处理，与发送时一致） */
+function autoPreviewKind() {
+  const want = detectIntent($('#input')?.value || '');
+  if (want === 'chat') return 'chat';
+  return capabilityCandidates(want).length ? want : 'chat';
+}
+
 function updateComposerMode() {
-  const isImage = selectedModel && getEffectiveType(selectedModel) === 'image';
+  const isAuto = selectedModel === AUTO_MODEL_ID;
+  const t = isAuto ? autoPreviewKind() : (selectedModel ? getEffectiveType(selectedModel) : '');
+  const isImage = t === 'image';
+  const isVideo = t === 'video';
+  const isAgnes = isAgnesProvider();
+
   $('#imageParamsRow').classList.toggle('hidden', !isImage);
-  if (isImage) {
-    $('#selSize').value = normalizeImageSize(settings.imageConfig.size);
-    $('#chkWatermark').checked = !!settings.imageConfig.watermark;
-    $('#input').placeholder = '描述你想生成的画面，Enter 发送…';
-  } else {
-    $('#input').placeholder = selectedModel
-      ? '输入消息，Enter 发送 / Shift+Enter 换行'
-      : '请先在上方选择模型';
+  // 图片参数分两套：Agnes 用「档位 + 比例」，其他（如商汤）用「精确像素 + 水印」
+  const agnesBox = $('#imgParamsAgnes'), pixelBox = $('#imgParamsPixel');
+  if (agnesBox) agnesBox.classList.toggle('hidden', !isAgnes);
+  if (pixelBox) pixelBox.classList.toggle('hidden', isAgnes);
+
+  const vidRow = $('#videoParamsRow');
+  if (vidRow) vidRow.classList.toggle('hidden', !isVideo);
+
+  if (isImage && isAgnes) {
+    const tierEl = $('#selImgTier'), ratioEl = $('#selImgRatio');
+    if (tierEl) tierEl.value = normalizeImgTier(settings.imageConfig.tier);
+    if (ratioEl) ratioEl.value = normalizeImgRatio(settings.imageConfig.ratio);
+  } else if (isImage) {
+    const sizeEl = $('#selSize'), wmEl = $('#chkWatermark');
+    if (sizeEl) sizeEl.value = normalizeImageSize(settings.imageConfig.size);
+    if (wmEl) wmEl.checked = !!settings.imageConfig.watermark;
   }
+  if (isVideo) {
+    const secEl = $('#selVideoSeconds'), aspEl = $('#selVideoAspect');
+    if (secEl) secEl.value = normalizeVideoSeconds(settings.videoConfig?.seconds);
+    if (aspEl) aspEl.value = normalizeVideoRatio(settings.videoConfig?.aspectRatio);
+  }
+
+  let ph;
+  if (isAuto) {
+    const who = t === 'image' ? '🎨 图片' : (t === 'video' ? '🎬 视频' : '💬 文本');
+    ph = `自动模式：当前输入将走 ${who}\n（说「画一只猫」「生成一段视频」自动切换；也可用 /img /video /chat 强制）`;
+  } else if (isVideo) {
+    ph = settings.videoEnabled
+      ? '描述你想生成的视频画面，Enter 发送…（异步任务，约需 1–3 分钟）'
+      : '当前供应商未开启视频能力，请到设置中开启';
+  } else if (isImage) {
+    ph = '描述你想生成的画面，Enter 发送…';
+  } else {
+    ph = selectedModel ? '输入消息，Enter 发送 / Shift+Enter 换行' : '请先在上方选择模型';
+  }
+  $('#input').placeholder = ph;
 }
 
 /* ---------------- 设置面板 ---------------- */
@@ -2145,6 +2645,8 @@ function syncProviderEditor() {
   $('#inpChatEndpoint').value = settings.chatEndpoint;
   $('#inpImageEndpoint').value = settings.imageEndpoint;
   $('#inpModelsEndpoint').value = settings.modelsEndpoint;
+  if ($('#chkVideoEnabled')) $('#chkVideoEnabled').checked = !!settings.videoEnabled;
+  renderAutoRouteUI();
   $('#inpKeys').value = settings.keys.map(k => k.value).join('\n');
   const ps = $('#inpProviderPreset');
   if (ps) {
@@ -2183,6 +2685,29 @@ function startRename(pid) {
   input.addEventListener('blur', commit);
 }
 
+/** 渲染「⚡ 自动路由」面板：三个能力槽位下拉（按当前供应商模型 + 白名单过滤）+ 白名单文本域 */
+function renderAutoRouteUI() {
+  const slots = [['chat', '#selSlotChat', '文本'], ['image', '#selSlotImage', '图片'], ['video', '#selSlotVideo', '视频']];
+  const all = visibleModels();
+  slots.forEach(([kind, sel, cn]) => {
+    const el = $(sel);
+    if (!el) return;
+    const opts = all.filter(m => getEffectiveType(m.id) === kind);
+    if (!opts.length) {
+      el.innerHTML = `<option value="">（当前供应商没有${cn}模型）</option>`;
+      el.disabled = true;
+      return;
+    }
+    el.disabled = false;
+    const cur = (settings.capabilityModels || {})[kind] || '';
+    el.innerHTML = `<option value="">自动选择（首个${cn}模型）</option>`
+      + opts.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('');
+    el.value = opts.some(m => m.id === cur) ? cur : '';
+  });
+  const ta = $('#taAllowedModels');
+  if (ta) ta.value = (settings.allowedModels || []).join('\n');
+}
+
 function openSettings() {
   renderProviderSelect();
   syncProviderEditor();
@@ -2191,6 +2716,7 @@ function openSettings() {
   $('#inpImageEndpoint').value = settings.imageEndpoint;
   $('#inpModelsEndpoint').value = settings.modelsEndpoint;
   $('#inpStream').checked = settings.streamOutput !== false;
+  $('#chkVideoEnabled').checked = !!settings.videoEnabled;
   $('#inpKeys').value = settings.keys.map(k => k.value).join('\n');
   // 记忆系统
   $('#selRecentRounds').value = String(clampRounds(settings.memory.recentRounds));
@@ -2226,6 +2752,16 @@ function applySettingsFromPanel() {
   settings.imageEndpoint = norm($('#inpImageEndpoint').value, settings.imageEndpoint || '');
   settings.modelsEndpoint = norm($('#inpModelsEndpoint').value, DEFAULTS.modelsEndpoint);
   settings.streamOutput = $('#inpStream').checked;
+  settings.videoEnabled = $('#chkVideoEnabled').checked;
+
+  // 自动路由：能力槽位 + 模型白名单
+  settings.capabilityModels = {
+    chat: $('#selSlotChat')?.value || '',
+    image: $('#selSlotImage')?.value || '',
+    video: $('#selSlotVideo')?.value || ''
+  };
+  settings.allowedModels = String($('#taAllowedModels')?.value || '')
+    .split('\n').map(s => s.trim()).filter(Boolean);
 
   // 记忆系统
   settings.memory.recentRounds = clampRounds($('#selRecentRounds').value);
@@ -2240,8 +2776,17 @@ function applySettingsFromPanel() {
     newKeys.every((k, i) => k.value === settings.keys[i].value);
   if (!sameAsOld) settings.keys = newKeys; // Key 变更后重置状态
 
+  // 白名单 / 槽位调整后，若当前所选模型已被隐藏则自动回退
+  if (selectedModel && selectedModel !== AUTO_MODEL_ID && !visibleModels().some(m => m.id === selectedModel)) {
+    selectedModel = null;
+  }
+  if (!selectedModel) { autoSelectModel(); syncSessionModel(); }
+
   saveSettings();
   renderKeyStatus();
+  renderModelDropdown();
+  updateModelButton();
+  updateComposerMode();
 }
 
 function maskKey(v) {
@@ -2325,6 +2870,7 @@ function bindEvents() {
   inputEl.addEventListener('input', () => {
     autoGrow(inputEl);
     syncSessionDraft();                 // 草稿实时跟随当前聊天（内存）
+    if (selectedModel === AUTO_MODEL_ID) updateComposerMode(); // 自动模式：实时预览将走的能力
   });
   inputEl.addEventListener('blur', () => persistHistory()); // 失焦落盘，防意外关闭丢失
   // 手动拖拽右下角手柄后：记住高度（本会话 + 持久化）
@@ -2594,6 +3140,34 @@ function bindEvents() {
   });
   $('#chkWatermark').addEventListener('change', (e) => {
     settings.imageConfig.watermark = e.target.checked;
+    saveSettings();
+  });
+
+  // Agnes 图片参数（档位 / 画幅）即时保存
+  const selImgTier = $('#selImgTier');
+  if (selImgTier) selImgTier.addEventListener('change', (e) => {
+    settings.imageConfig.tier = normalizeImgTier(e.target.value);
+    e.target.value = settings.imageConfig.tier;
+    saveSettings();
+  });
+  const selImgRatio = $('#selImgRatio');
+  if (selImgRatio) selImgRatio.addEventListener('change', (e) => {
+    settings.imageConfig.ratio = normalizeImgRatio(e.target.value);
+    e.target.value = settings.imageConfig.ratio;
+    saveSettings();
+  });
+
+  // 视频参数即时保存（秒数 / 画幅）
+  const selVidSec = $('#selVideoSeconds');
+  if (selVidSec) selVidSec.addEventListener('change', (e) => {
+    settings.videoConfig.seconds = normalizeVideoSeconds(e.target.value);
+    e.target.value = settings.videoConfig.seconds;
+    saveSettings();
+  });
+  const selVidAspect = $('#selVideoAspect');
+  if (selVidAspect) selVidAspect.addEventListener('change', (e) => {
+    settings.videoConfig.aspectRatio = normalizeVideoRatio(e.target.value);
+    e.target.value = settings.videoConfig.aspectRatio;
     saveSettings();
   });
 

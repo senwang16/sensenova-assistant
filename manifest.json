@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SenseNova Assistant",
-  "version": "1.0.0",
-  "description": "商汤大模型多账号智能助手：多 Key 轮换、429/401 无感重试、文本/绘图模型智能路由、图片本地转存永不过期。",
+  "version": "1.1.0",
+  "description": "商汤 / Agnes 多账号智能助手：多 Key 轮换、429/401/5xx 无感重试、限流排队、文本/绘图/视频智能路由与按意图自动分流，媒体本地转存永不过期。",
   "action": {
     "default_popup": "popup.html",
     "default_title": "SenseNova Assistant",

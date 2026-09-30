@@ -1,5 +1,10 @@
 # Agnes 文本 / 图片 / 视频能力接入修改方案
 
+> ⚠️ **已过时（保留作历史记录）**：本方案撰于接入前，其中「视频参数」与「agnes-video-v2.0」
+> 已不准确 —— v2.0 官方标注 2026-09-25 退役，视频接口改为 2.5 系列的
+> `mode` + `seconds` + `size("720P")` + `aspect_ratio`，轮询需带 `model_name` 且结果在 `metadata.url`。
+> 最新规格见 [`AGNES_COMPAT_AND_AUTO_ROUTING.md`](./AGNES_COMPAT_AND_AUTO_ROUTING.md)。
+
 > 状态：**待审核**（尚未改任何代码）
 > 目标：为 SenseNova Assistant 扩展新增 Agnes 供应商的文本、图片、视频三种生成能力。
 > 涉及文件：`popup.js`（主）、`manifest.json`（主机权限）、`popup.html`（视频参数/冷却提示 UI）、`popup.css`（视频消息样式）。
@@ -14,7 +19,7 @@ Agnes 提供 OpenAI 兼容 API，端点与本扩展现有架构完全对得上�
 |---|---|---|---|
 | 文本 | `POST /v1/chat/completions` | `agnes-2.5-flash`、`agnes-2.5-pro-beta` | 否（复用 `doChat`） |
 | 图片 | `POST /v1/images/generations` | `agnes-image-2.0-flash`、`agnes-image-2.1-flash` | 否（复用 `doImageGeneration`，仅尺寸参数需调整） |
-| 视频 | `POST /v1/videos`（建任务）+ `GET /agnesapi?video_id=`（轮询结果） | `agnes-video-v2.0`、`agnes-video-2.5-flash` | **是**（异步任务轮询，新写 `doVideoGeneration`） |
+| 视频 | `POST /v1/videos`（建任务）+ `GET /agnesapi?video_id=`（轮询结果） | `agnes-video-2.5-flash`（旧 `agnes-video-v2.0` 已退役，勿用） | **是**（异步任务轮询，新写 `doVideoGeneration`） |
 
 Base URL（国际版）：`https://apihub.agnes-ai.com/v1`
 

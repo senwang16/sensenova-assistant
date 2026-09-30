@@ -53,7 +53,7 @@
         </svg>
         <div class="brand-text">
           <span class="brand-name">SenseNova Assistant</span>
-          <span class="brand-sub">多账号轮换 · 聊天 / 绘图</span>
+          <span class="brand-sub">多账号轮换 · 聊天 / 绘图 / 视频</span>
         </div>
       </div>
       <div class="header-actions">
@@ -82,13 +82,13 @@
                 font-family="system-ui, sans-serif">S</text>
         </svg>
         <h3>SenseNova Assistant</h3>
-        <p class="es-sub">多 Key 轮换 · 429 无感重试 · 聊天 / 绘图一体</p>
+        <p class="es-sub">多 Key 轮换 · 429 / 5xx 无感重试 · 聊天 / 绘图 / 视频一体</p>
         <ol class="es-steps">
           <li>点击右上角 <b>⚙️</b> 填写 Base URL 与多个 API Key（每行一个）</li>
-          <li>点击 <b>⟳</b> 拉取模型列表，自动分类 💬 文本 / 🎨 绘图</li>
-          <li>选择模型，即可开始多轮对话或 AI 绘图</li>
+          <li>点击 <b>⟳</b> 拉取模型列表，自动分类 💬 文本 / 🎨 绘图 / 🎬 视频</li>
+          <li>选模型即可对话或生成；或选 <b>⚡ 自动</b>，按你的输入自动分流</li>
         </ol>
-        <p class="es-tip">🎨 绘图结果自动转存本地缓存，永不过期 · ⛶ 可在新标签页打开完整界面</p>
+        <p class="es-tip">🎨 绘图与 🎬 视频结果自动转存本地缓存，永不过期 · ⛶ 可在新标签页打开完整界面</p>
       </div>
     </main>
 
@@ -110,28 +110,71 @@
         </button>
         <button id="btnRefreshModels" class="icon-btn" title="刷新模型列表">⟳</button>
 
-        <!-- 绘图参数（仅绘图模型显示，挤在角落） -->
+        <!-- 绘图参数（仅绘图模型显示，按供应商切换参数形态） -->
         <div id="imageParamsRow" class="hidden">
-          <select id="selSize" title="生成分辨率（商汤 U1 支持的 2K 尺寸）">
-            <option value="2048x2048">2048×2048 · 1:1 方形</option>
-            <option value="2752x1536">2752×1536 · 16:9 横版</option>
-            <option value="1536x2752">1536×2752 · 9:16 竖版</option>
-            <option value="2496x1664">2496×1664 · 3:2 横版</option>
-            <option value="1664x2496">1664x2496 · 2:3 竖版</option>
-            <option value="2368x1760">2368×1760 · 4:3 横版</option>
-            <option value="1760x2368">1760×2368 · 3:4 竖版</option>
-            <option value="2272x1824">2272×1824 · 5:4 横版</option>
-            <option value="1824x2272">1824×2272 · 4:5 竖版</option>
-            <option value="3072x1376">3072×1376 · 21:9 超宽</option>
-            <option value="1344x3136">1344×3136 · 9:21 超长竖版</option>
-            <option value="2560x720">2560×720 · 32:9 全景横幅</option>
-            <option value="3072x864">3072×864 · 32:9 全景横幅</option>
+          <!-- Agnes：分辨率档位 + 画幅比例 -->
+          <span id="imgParamsAgnes" class="param-group">
+            <select id="selImgTier" title="分辨率档位（Agnes 图片；1K/2K 额度较高，3K/4K 免费额度仅 1 张/分钟）">
+              <option value="1K">1K</option>
+              <option value="2K" selected>2K</option>
+              <option value="3K">3K</option>
+              <option value="4K">4K</option>
+            </select>
+            <select id="selImgRatio" title="画幅比例（Agnes 图片）">
+              <option value="16:9">16:9 横版</option>
+              <option value="1:1">1:1 方形</option>
+              <option value="9:16">9:16 竖版</option>
+              <option value="4:3">4:3 横版</option>
+              <option value="3:4">3:4 竖版</option>
+              <option value="3:2">3:2 横版</option>
+              <option value="2:3">2:3 竖版</option>
+              <option value="21:9">21:9 超宽</option>
+            </select>
+          </span>
+          <!-- 商汤等：精确像素尺寸 + 水印 -->
+          <span id="imgParamsPixel" class="param-group">
+            <select id="selSize" title="生成分辨率（商汤 U1 支持的 2K 尺寸）">
+              <option value="2048x2048">2048×2048 · 1:1 方形</option>
+              <option value="2752x1536">2752×1536 · 16:9 横版</option>
+              <option value="1536x2752">1536×2752 · 9:16 竖版</option>
+              <option value="2496x1664">2496×1664 · 3:2 横版</option>
+              <option value="1664x2496">1664x2496 · 2:3 竖版</option>
+              <option value="2368x1760">2368×1760 · 4:3 横版</option>
+              <option value="1760x2368">1760×2368 · 3:4 竖版</option>
+              <option value="2272x1824">2272×1824 · 5:4 横版</option>
+              <option value="1824x2272">1824×2272 · 4:5 竖版</option>
+              <option value="3072x1376">3072×1376 · 21:9 超宽</option>
+              <option value="1344x3136">1344×3136 · 9:21 超长竖版</option>
+              <option value="2560x720">2560×720 · 32:9 全景横幅</option>
+              <option value="3072x864">3072×864 · 32:9 全景横幅</option>
+            </select>
+            <label class="switch" title="是否添加水印（默认关闭）">
+              <input type="checkbox" id="chkWatermark">
+              <span class="slider"></span>
+              <span class="sw-text">水印</span>
+            </label>
+          </span>
+        </div>
+
+        <!-- 视频参数（仅视频模型显示，挤在角落） -->
+        <div id="videoParamsRow" class="hidden">
+          <span class="ip-label">🎬</span>
+          <select id="selVideoSeconds" title="视频时长（Agnes 2.5-flash 支持 4–12 秒）">
+            <option value="4">4s</option>
+            <option value="5" selected>5s</option>
+            <option value="6">6s</option>
+            <option value="8">8s</option>
+            <option value="10">10s</option>
+            <option value="12">12s</option>
           </select>
-          <label class="switch" title="是否添加水印（默认关闭）">
-            <input type="checkbox" id="chkWatermark">
-            <span class="slider"></span>
-            <span class="sw-text">水印</span>
-          </label>
+          <select id="selVideoAspect" title="画幅比例（Agnes 2.5-flash 输出固定 720P）">
+            <option value="16:9">16:9 横版</option>
+            <option value="9:16">9:16 竖版</option>
+            <option value="1:1">1:1 方形</option>
+            <option value="4:3">4:3 横版</option>
+            <option value="3:4">3:4 竖版</option>
+            <option value="21:9">21:9 超宽</option>
+          </select>
         </div>
 
         <!-- 自定义模型下拉框（向上弹出） -->
@@ -141,7 +184,7 @@
             <span id="mdCount" class="md-count"></span>
           </div>
           <div id="modelList" class="md-list"></div>
-          <div class="md-tip">点击模型左侧图标可手动修正类型（💬 文本 / 🎨 绘图）</div>
+          <div class="md-tip">💬 文本 / 🎨 绘图 / 🎬 视频 自动分类；点击图标可手动修正类型。选「⚡ 自动」则按输入内容自动分流</div>
         </div>
       </div>
     </footer>
@@ -180,6 +223,14 @@
             <div class="field">
               <label for="inpImageEndpoint">绘图端点</label>
               <input id="inpImageEndpoint" type="text" spellcheck="false">
+            </div>
+            <div class="field">
+              <label class="switch" title="开启后 🎬 视频模型才可选用（视频为异步任务，Agnes 免费额度限 1 次/分钟）">
+                <input type="checkbox" id="chkVideoEnabled">
+                <span class="slider"></span>
+                <span class="sw-text">视频生成能力</span>
+              </label>
+              <div class="hint">仅对支持视频生成的供应商生效（如 Agnes 的 agnes-video-2.5-flash）；开启后在模型列表中选择 🎬 视频模型即可，时长与画幅在输入框下方调整</div>
             </div>
             <div class="field">
               <label for="inpModelsEndpoint">模型列表端点</label>
@@ -260,6 +311,35 @@
                 <span class="sw-text">查询改写（检索前消解"它/这个"等指代）</span>
               </label>
               <div class="hint">仅在问题含指代词时触发；每次多一次小模型调用，换取更准的召回</div>
+            </div>
+          </details>
+
+          <details class="adv">
+            <summary>⚡ 自动路由与模型白名单</summary>
+            <div class="hint" style="margin-bottom:6px">
+              在模型列表选择「⚡ 自动（按意图路由）」后，扩展会按你的输入自动分流：说「画一只猫」走图片模型，
+              说「生成一段视频」走视频模型，其余走文本模型。也可用 <b>/img</b> <b>/video</b> <b>/chat</b> 前缀强制指定。<br>
+              <b>跨供应商</b>：自动模式会在<b>所有已配 Key 的供应商</b>里寻找具备该能力的模型 —— 当前供应商优先，
+              失败自动换下一个，成功即止（例如当前在商汤，让它生成视频会自动改用 Agnes）。
+            </div>
+            <div class="field">
+              <label for="selSlotChat">💬 文本能力 → 模型</label>
+              <select id="selSlotChat"></select>
+            </div>
+            <div class="field">
+              <label for="selSlotImage">🎨 图片能力 → 模型</label>
+              <select id="selSlotImage"></select>
+            </div>
+            <div class="field">
+              <label for="selSlotVideo">🎬 视频能力 → 模型 <span class="label-sub">（仅 Agnes 这类供应商提供）</span></label>
+              <select id="selSlotVideo"></select>
+              <div class="hint">此槽位决定「该能力优先用哪个模型」；自动路由会先在所有已配 Key 的供应商里找具备该能力的模型，当前供应商优先，失败自动换下一个。商汤没有视频模型，视频需求会自动落到 Agnes</div>
+            </div>
+            <div class="field">
+              <label for="taAllowedModels">模型白名单 <span class="label-sub">（一行一个，留空 = 不限）</span></label>
+              <textarea id="taAllowedModels" rows="3" spellcheck="false"
+                        placeholder="留空 = 显示全部模型&#10;agnes-3.0-flash&#10;agnes-image-2.5-flash&#10;agnes-video-2.5-flash"></textarea>
+              <div class="hint">不在白名单内的模型会从列表中隐藏。Agnes 默认只保留免费模型（文本 / 图片 / 视频各系列），避免误选收费模型</div>
             </div>
           </details>
 
