@@ -22,9 +22,14 @@ videoConfig / videoEnabled / allowedModels / capabilityModels` **一律是「当
   - `onKeyUsed` 回调用于把「本次实际用的 Key」交回调用方（视频轮询必须复用创建任务的 Key）
 - 视频轮询**不走** `requestWithRotation`（不计入视频 RPM，且需固定 Key）
 
-### 媒体缓存
-图片/视频一律抓取转 Base64 落地（商汤图片 URL 仅 1 小时有效）。
-限额：图片 20 张 / 10MB；视频 10 段 / 300MB，超出删最旧。
+### 媒体缓存（D1 方案 A，2026-09-30 起）
+图片/视频 Blob 存 **IndexedDB `sensenova_memory` v2 的 `media` store**（{id, sessionId, mime, bytes, ts, blob}）；
+消息只存轻量引用 `mediaId/mime/bytes`，`content` 仅留远端 URL 兜底。**双形态兼容是铁律**：
+旧内嵌 data URL 的消息（未迁移/转存失败降级）必须继续可用——所有消费点走 `hasLocalMedia`/`mediaBytes`/
+`ensureMediaUrl`/`releaseMedia` 助手，不要直接读 `msg.content` 当媒体。删除/裁剪媒体消息必须 `releaseMedia`。
+`persistHistory` 全量写盘不再含媒体（这是当初改它的原因），旧数据由 `migrateInlineMedia()` 启动后台迁移。
+
+限额（**每会话**，非全局）：图片 20 张 / 10MB；视频 10 段 / 300MB，超出删最旧。
 
 ## 供应商能力矩阵（截至 2026-09）
 | 能力 | 商汤 SenseNova | Agnes |
@@ -62,9 +67,20 @@ Agnes 免费 Key 官方「实际可执行 RPM」（Token Plan FAQ 2026-09-23 更
 - 报告要给 `file:line` 级别的可追溯证据，不要空泛结论
 - 只改自己产出的文件，不得触碰其它 AI/工具生成的产物
 - 严格区分「离线验证」与「真机联调」，不要把离线通过说成功能已可用
+- popup 弹窗**不可用 window.prompt**（crbug 32883，返回 null）——需要用户输入一律行内输入框
+  （参考 `startRename` / `renameSession` 的 done-guard 防blur 双提交）；confirm/alert 可用
+- 记忆链路（综述/检索/改写/嵌入）全链路必须 `withTimeout` 限时，绝不阻塞发送；
+  嵌入探测按供应商运行时缓存 `_embedModeByProvider`，禁止全局持久化降级
+- 供应商切换/投影纪律：**先 absorb 再 project**（switchProvider、runUnderProvider 一致）
 
 ## 可复用的验证手段
 `~/.workbuddy/skills/chrome-ext-offline-smoke/` —— 用 Node `vm` sandbox stub `chrome`/`document`/`fetch`
 后直接调纯函数做断言。骨架见该技能 `examples/sensenova-assistant.harness.mjs`。
 **注意**：sandbox 必须显式注入 `URL` / `TextDecoder` / `AbortController` 等宿主全局，
 否则代码里的 `catch` 会吞掉异常导致「假通过」。
+
+## 工具使用红线（2026-09-30 事故教训）
+- **禁止用 PowerShell 文本管道改含中文的文件**（Set-Content/Get-Content 会 GBK↔UTF-8 乱码并吞引号，
+  manifest.json 曾被改废）。改文件一律用 Write 工具或 python 二进制操作；Write 可能保留 BOM，JSON 文件用
+  python 校验 `json.load(..., encoding='utf-8')` 并顺手去 BOM。
+- PowerShell 与 Bash 工具间存在**执行时序错位**：打包/验证类操作放同一个 python 进程内闭环，不要跨工具链验证。

@@ -40,7 +40,7 @@ const DEFAULTS = {
     retrievalEnabled: true,         // 跨会话向量检索开关
     rewriteEnabled: true,           // 检索前查询改写开关（消解指代）
     topK: 6,                        // 召回条数
-    embeddingMode: ''               // ''=未探测 / 'api' / 'local'（本地词法嵌入）
+    embedModel: 'embedding-1'       // /embeddings 模型名（商汤 Token Plan 默认 embedding-1，可在存储中改）
   }
 };
 
@@ -389,9 +389,17 @@ const CHAT_KEYWORDS = ['sensechat', 'chat', 'glm', 'deepseek', 'gpt', 'qwen', 'l
 
 const MIN_SUMMARY_OVERFLOW = 6;                // 综述触发阈值：窗口外未综述消息 ≥ 6 条（约 3 轮）
 const MEM_SEARCH_BUDGET_MS = 8000;             // 记忆检索总预算：超时放弃本层，绝不阻塞发送
+const MEM_SUMMARY_BUDGET_MS = 8000;            // 发送前补做综述的限时：超时跳过（综述水位未推进，下轮重试）
 const MEM_REWRITE_BUDGET_MS = 6000;            // 查询改写限时：超时用原句检索
 const MEM_PROBE_TIMEOUT_MS = 6000;             // embeddings 探测限时（单发，不走退避）
 const MEM_API_EMBED_TIMEOUT_MS = 15000;        // API 嵌入单次限时
+
+/** 记忆链路限时包装：超时返回 fallback（不抛错、不阻塞发送）；底层任务若稍后完成，其结果被丢弃 */
+function withTimeout(promise, ms, fallback) {
+  let timer = 0;
+  const gate = new Promise(resolve => { timer = setTimeout(() => resolve(fallback), ms); });
+  return Promise.race([promise, gate]).finally(() => clearTimeout(timer));
+}
 const MAX_IMAGE_COUNT = 20;                   // 最多缓存 20 张图
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;     // 图片缓存总量上限 10MB
 const MAX_VIDEO_COUNT = 10;                   // 最多缓存 10 段视频
@@ -403,7 +411,8 @@ const SERVER_ERR_BACKOFF_MS = [2000, 6000, 15000]; // 5xx 服务端抖动重试�
  * 文本 10（官方 2026-09-23 起由 20 下调 50%）；图片 1K=20 / 2K=10 / 3K=1 / 4K=1；视频 1（账号级）。
  * 官方明确「同类型 Key 共享同一限制池」（两把免费 Key 共用同一个 free/default 池），
  * 多把免费 Key 不会放大 RPM —— acquireRate 不按 Key 数放大。仅对 Agnes 供应商生效。 */
-const AGNES_RPM = { chat: 10, video: 1, image: { '1K': 20, '2K': 10, '3K': 1, '4K': 1 } };
+const AGNES_RPM = { chat: 10, image: { '1K': 20, '2K': 10, '3K': 1, '4K': 1 } };
+// 视频不走 acquireRate（无调用点）：1 RPM 由 doVideoGeneration 的 lastVideoTs 检查承担
 const _rateLastTs = {};                       // 限流桶 → 上次发起时间戳
 const COOLDOWN_429_MS = 60 * 1000;            // 429 限流冷却 60s
 const COOLDOWN_401_MS = 10 * 60 * 1000;       // 401 鉴权失败冷却 10min
@@ -422,7 +431,7 @@ let sessions = [];        // 所有聊天会话 [{id,title,createdAt,updatedAt,m
 let trash = [];           // 回收站（软删除的会话，可恢复/彻底清理）
 let currentSessionId = null;
 let chatHistory = [];     // 当前会话消息数组（始终引用 curSession().messages）
-let keyPointer = -1;      // Round-Robin 指针
+const _keyPointers = {};  // Round-Robin 指针按供应商独立记账（providerId → 下标），避免跨供应商串计数
 let selectedModel = null; // 当前选中模型 id
 const generating = new Map(); // sessionId -> AbortController（生成任务按会话隔离，切聊天互不干扰）
 let mdFilterText = '';    // 模型下拉框过滤词
@@ -529,10 +538,13 @@ function normEndpoint(v, def, allowEmpty) {
 }
 
 /** 规范化一个已持久化的供应商对象（兼容缺字段/旧结构） */
+/* 已退役模型（官方下线）：模型列表是持久化缓存，不清理会一直显示且生成必 404 */
+const RETIRED_MODELS = ['agnes-video-v2.0'];
+
 function normalizeProvider(p, idx) {
   const baseUrl = String(p.baseUrl || '').trim().replace(/\/+$/, '');
   const isAgnes = (p.name || '').toString().toLowerCase().includes('agnes');
-  return {
+  const out = {
     id: p.id || 'prov_' + (idx + 1) + '_' + uid(),
     name: (p.name || '供应商 ' + (idx + 1)).toString().slice(0, 30),
     baseUrl,
@@ -549,18 +561,23 @@ function normalizeProvider(p, idx) {
     })),
     modelTypeOverrides: p.modelTypeOverrides || {},
     noStreamModels: p.noStreamModels || {},
-    cachedModels: Array.isArray(p.cachedModels) ? p.cachedModels : [],
+    cachedModels: (Array.isArray(p.cachedModels) ? p.cachedModels : []).filter(m => !RETIRED_MODELS.includes(m.id)),
     imageConfig: { ...DEFAULTS.imageConfig, ...(p.imageConfig || {}) },
     videoConfig: { ...DEFAULTS.videoConfig, ...(p.videoConfig || {}) },
     videoEnabled: p.videoEnabled ?? isAgnes,
     lastVideoTs: p.lastVideoTs || 0,
     // 白名单：显式配置优先；未配置时若为 Agnes，默认限制在免费模型内（避免误选收费模型）
-    allowedModels: Array.isArray(p.allowedModels) && p.allowedModels.length
+    allowedModels: (Array.isArray(p.allowedModels) && p.allowedModels.length
       ? p.allowedModels.slice()
-      : (isAgnes ? AGNES_FREE_MODELS.slice() : []),
+      : (isAgnes ? AGNES_FREE_MODELS.slice() : [])).filter(id => !RETIRED_MODELS.includes(id)),
     capabilityModels: { ...DEFAULTS.capabilityModels, ...(isAgnes ? AGNES_DEFAULT_SLOTS : {}), ...(p.capabilityModels || {}) },
     lastModel: p.lastModel || ''
   };
+  // 能力槽位指向退役模型时清空（回落到自动选择）
+  for (const k of Object.keys(out.capabilityModels)) {
+    if (RETIRED_MODELS.includes(out.capabilityModels[k])) out.capabilityModels[k] = '';
+  }
+  return out;
 }
 
 /** 把指定供应商的配置投影到顶层 settings + 载入其模型列表 */
@@ -755,6 +772,11 @@ async function loadAll() {
   // 投影当前供应商到顶层（既有请求代码零改动地读取顶层配置）
   projectProvider(curProvider());
 
+  // 一次性迁移：旧版本创建的供应商 videoEnabled 恒为 false（当时该字段还不存在），
+  // 导致 Agnes 视频模型在列表里永久置灰。按「模型列表里确有视频模型」自动开启一次；
+  // 迁移完成后用户手动关闭不再干预（videoCapabilityMigrated 标记兜底）
+  if (migrateVideoCapability()) { absorbProvider(); saveSettings(); }
+
   /* 会话数据加载（含旧版 history 单流自动迁移） */
   sessions = Array.isArray(data.sessions) ? data.sessions : [];
   trash = Array.isArray(data.trash) ? data.trash : [];
@@ -775,10 +797,49 @@ async function loadAll() {
   chatHistory = curSession().messages;
 }
 
+/** 旧数据迁移：把 sessions/trash 里内嵌的 data URL 媒体转存 IndexedDB（D1 方案 A 一次性迁移）。
+ *  失败安全：任何一步失败都保留原内嵌数据（旧模式继续可用），绝不丢媒体。
+ *  启动后后台执行，完成后重渲染当前会话（其余会话切换时按新字段渲染）。 */
+async function migrateInlineMedia() {
+  let changed = false;
+  try {
+    const all = [...sessions, ...trash];
+    for (const s of all) {
+      for (const m of (s.messages || [])) {
+        if (m.mediaId || !isDataUrl(m.content)) continue;
+        try {
+          const blob = await dataUrlToBlob(m.content);
+          const rec = { id: 'media_' + uid(), sessionId: s.id, mime: blob.type || '', bytes: blob.size, ts: m.ts || Date.now(), blob };
+          await mediaPut(rec);
+          m.mediaId = rec.id; m.mime = rec.mime; m.bytes = rec.bytes;
+          m.content = '';       // 旧内嵌数据没有可靠的远端 URL 可兜底，置空（渲染走 mediaId）
+          changed = true;
+        } catch (_) { /* 单条失败保留内嵌，下次启动重试 */ }
+      }
+    }
+  } catch (_) { return false; }   // IndexedDB 打不开：整体放弃，旧模式继续
+  return changed;
+}
+
 async function saveSettings() {
   absorbProvider(); // 顶层活动值 → 写回当前供应商，再整体持久化
   try { await chrome.storage.local.set({ settings }); }
   catch (e) { console.warn('保存设置失败', e); }
+}
+
+/** 一次性迁移：给「模型列表里确有视频模型但 videoEnabled 为 false」的存量供应商自动开启视频能力。
+ *  背景：videoEnabled 字段引入前 makeProvider 一律存 false，normalizeProvider 的 `?? isAgnes`
+ *  只补缺失字段、补不了显式 false → 老用户视频模型永久置灰。完成后由 videoCapabilityMigrated 标记
+ *  保证只跑一次，之后用户手动关闭不再被覆盖。返回是否发生了开启。 */
+function migrateVideoCapability() {
+  if (settings.videoCapabilityMigrated) return false;
+  let healed = false;
+  for (const p of settings.providers || []) {
+    if (p.videoEnabled) continue;
+    if ((p.cachedModels || []).some(m => classifyModel(m.id) === 'video')) { p.videoEnabled = true; healed = true; }
+  }
+  settings.videoCapabilityMigrated = true;
+  return healed;
 }
 
 /** 持久化会话数据（当前会话消息通过引用包含在 sessions 内） */
@@ -786,11 +847,12 @@ async function persistHistory() {
   try {
     await chrome.storage.local.set({ sessions, trash, currentSessionId });
   } catch (e) {
-    // 配额不足时逐步删除当前会话最旧图片后重试
+    // 配额不足时逐步删除当前会话最旧图片后重试（IndexedDB/内嵌双形态都参与裁剪）
     for (let i = 0; i < 10; i++) {
-      const idx = chatHistory.findIndex(m => m.type === 'image' && isDataUrl(m.content));
+      const idx = chatHistory.findIndex(m => m.type === 'image' && hasLocalMedia(m));
       if (idx === -1) break;
-      chatHistory.splice(idx, 1);
+      const [removed] = chatHistory.splice(idx, 1);
+      releaseMedia(removed);
       try { await chrome.storage.local.set({ sessions, trash, currentSessionId }); return; } catch (_) { /* 继续裁剪 */ }
     }
     toast('本地存储空间不足，部分历史未能保存', 'error');
@@ -886,18 +948,71 @@ async function switchSession(id) {
   applySessionUI();
 }
 
-/** 重命名 */
-async function renameSession(id) {
+/** 重命名：行内输入框（popup 弹窗不支持 window.prompt，crbug 32883 会静默返回 null，故不用 prompt） */
+function renameSession(id) {
   const s = sessions.find(x => x.id === id);
   if (!s) return;
-  const name = prompt('修改聊天名称：', s.title);
-  if (name === null) return; // 取消
-  const t = name.trim().slice(0, 40);
-  if (!t) { toast('名称不能为空', 'error'); return; }
-  s.title = t;
-  await persistHistory();
-  renderSessionList();
-  toast('已重命名', 'success');
+  const item = document.querySelector(`#sessionList .ss-item[data-id="${CSS.escape(id)}"] .ss-name`);
+  if (!item) return;
+  const old = s.title;
+  const input = document.createElement('input');
+  input.className = 'ss-rename-input';
+  input.value = old;
+  input.maxLength = 40;
+  item.replaceWith(input);
+  input.focus();
+  input.select();
+  input.addEventListener('click', e => e.stopPropagation()); // 点输入框不触发会话切换
+  let done = false;
+  const commit = async () => {
+    if (done) return; done = true;               // Enter 提交后 input 脱离 DOM 会再触发 blur，防双重执行
+    const t = input.value.trim().slice(0, 40);
+    if (t && t !== old) { s.title = t; await persistHistory(); toast('已重命名', 'success'); }
+    renderSessionList();
+  };
+  const cancel = () => { if (done) return; done = true; renderSessionList(); };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', commit);        // 失焦 = 提交（与供应商行内重命名行为一致）
+}
+
+/** 移动会话到分类：行内输入框 + 现有分类 datalist 建议（留空 = 未分类，同 prompt 版语义） */
+function moveSessionCategory(id) {
+  const s = sessions.find(x => x.id === id);
+  if (!s) return;
+  const item = document.querySelector(`#sessionList .ss-item[data-id="${CSS.escape(id)}"] .ss-name`);
+  if (!item) return;
+  const cats = [...new Set(sessions.map(x => x.category).filter(Boolean))];
+  const input = document.createElement('input');
+  input.className = 'ss-rename-input';
+  input.value = s.category || '';
+  input.placeholder = '留空 = 未分类';
+  input.maxLength = 20;
+  input.setAttribute('list', 'ssCatOptions_' + CSS.escape(id));
+  const dl = document.createElement('datalist');   // 现有分类作为输入建议
+  dl.id = 'ssCatOptions_' + CSS.escape(id);
+  dl.innerHTML = cats.map(c => `<option value="${escapeHtml(c)}"></option>`).join('');
+  item.replaceWith(input);
+  input.closest('#sessionList').appendChild(dl);   // 提交后 renderSessionList 重建 DOM，随移除
+  input.focus();
+  input.select();
+  input.addEventListener('click', e => e.stopPropagation());
+  let done = false;
+  const commit = async () => {
+    if (done) return; done = true;
+    s.category = input.value.trim().slice(0, 20);
+    await persistHistory();
+    renderSessionList();
+    toast(s.category ? `已移动到「${s.category}」` : '已移回未分类', 'success');
+  };
+  const cancel = () => { if (done) return; done = true; renderSessionList(); };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', commit);
 }
 
 /** 删除 → 移入回收站（软删除，可恢复） */
@@ -943,12 +1058,13 @@ async function restoreSession(id) {
   toast('已恢复：' + s.title, 'success');
 }
 
-/** 彻底删除：文字 + Base64 图片 + 向量数据 + 综述一并清理，不可恢复 */
+/** 彻底删除：文字 + 本地媒体（IndexedDB/内嵌）+ 向量数据 + 综述一并清理，不可恢复 */
 async function purgeSession(id) {
   const idx = trash.findIndex(x => x.id === id);
   if (idx === -1) return;
   const [s] = trash.splice(idx, 1);
-  s.messages = []; // 释放消息（含图片 Base64）
+  s.messages.forEach(releaseMedia);   // 联动删除 IndexedDB 媒体 Blob（旧内嵌形态随消息释放）
+  s.messages = []; // 释放消息
   s.summary = '';
   s.summarizedUpTo = 0;
   await persistHistory(); // 从 storage 移除该会话全部数据
@@ -958,10 +1074,11 @@ async function purgeSession(id) {
   toast('已彻底删除（含图片与向量数据）', 'success');
 }
 
-/** 清空回收站：二次确认后彻底清理全部（含向量） */
+/** 清空回收站：二次确认后彻底清理全部（含媒体与向量） */
 async function emptyTrash() {
   if (!trash.length) { toast('回收站已是空的'); return; }
   const ids = trash.map(s => s.id);
+  trash.forEach(s => s.messages.forEach(releaseMedia));   // 联动删除 IndexedDB 媒体 Blob
   trash = [];
   await persistHistory();
   for (const sid of ids) await memDeleteBySession(sid).catch(() => {}); // 清理全部向量
@@ -1044,20 +1161,6 @@ function renderTrashList() {
       <button class="tr-act restore" data-act="restore" data-id="${escapeHtml(s.id)}" title="恢复到聊天列表">↩</button>
       <button class="tr-act purge" data-act="purge" data-id="${escapeHtml(s.id)}" title="彻底删除（含文字、图片与向量数据）">✕</button>
     </div>`).join('') || '<div class="sb-empty">回收站是空的</div>';
-}
-
-/** 移动会话到分类（输入名称即建新分类，留空 = 未分类） */
-async function moveSessionCategory(id) {
-  const s = sessions.find(x => x.id === id);
-  if (!s) return;
-  const cats = [...new Set(sessions.map(x => x.category).filter(Boolean))];
-  const tip = cats.length ? `已有分类：${cats.join('、')}` : '暂无自定义分类';
-  const name = prompt(`${tip}\n输入目标分类名称（留空 = 未分类）：`, s.category || '');
-  if (name === null) return; // 取消
-  s.category = name.trim().slice(0, 20);
-  await persistHistory();
-  renderSessionList();
-  toast(s.category ? `已移动到「${s.category}」` : '已移回未分类', 'success');
 }
 
 /* ---------------- 模型分类 ---------------- */
@@ -1149,13 +1252,17 @@ function isKeyUsable(k) {
   return k.status !== 'invalid' && Date.now() >= (k.coolingUntil || 0);
 }
 
-/** Round-Robin：指针自动指向下一个可用 Key（keys 由调用方传入，杜绝跨供应商串 Key） */
+/** Round-Robin：指针自动指向下一个可用 Key（keys 由调用方传入快照，杜绝跨供应商串 Key；
+ *  指针按供应商维度独立记账，切换供应商不打乱各家的轮换顺序） */
 function pickNextKey(keys) {
   if (!keys.length) return null;
+  const pid = settings.currentProviderId || 'default';
+  let ptr = _keyPointers[pid] ?? -1;
   for (let i = 0; i < keys.length; i++) {
-    keyPointer = (keyPointer + 1) % keys.length;
-    if (isKeyUsable(keys[keyPointer])) return keys[keyPointer];
+    ptr = (ptr + 1) % keys.length;
+    if (isKeyUsable(keys[ptr])) { _keyPointers[pid] = ptr; return keys[ptr]; }
   }
+  _keyPointers[pid] = ptr;  // 全不可用也推进，避免下次总从同一把 Key 开始撞
   return null;
 }
 
@@ -1328,23 +1435,44 @@ const MEM_SYSTEM_PREAMBLE = '你是一个具有长期记忆的助手。以下背
 /* ---------- 本地向量库（IndexedDB，浏览器通用标准方案） ---------- */
 const MEM_DB_NAME = 'sensenova_memory';
 const MEM_STORE = 'vectors';
+const MEDIA_STORE = 'media';   // 图片/视频 Blob（D1 方案 A：媒体出 storage.local，sessions 只留轻量引用）
 let memDbPromise = null;
 
 function openMemDB() {
   if (memDbPromise) return memDbPromise;
   memDbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(MEM_DB_NAME, 1);
+    const req = indexedDB.open(MEM_DB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(MEM_STORE)) {
         const store = db.createObjectStore(MEM_STORE, { keyPath: 'id' });
         store.createIndex('sessionId', 'sessionId', { unique: false });
       }
+      if (!db.objectStoreNames.contains(MEDIA_STORE)) {
+        const mstore = db.createObjectStore(MEDIA_STORE, { keyPath: 'id' });
+        mstore.createIndex('sessionId', 'sessionId', { unique: false });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   }).catch(e => { memDbPromise = null; throw e; });
   return memDbPromise;
+}
+
+/* ---------- 媒体 Blob 库（media store） ---------- */
+function mediaStore(mode) {
+  return openMemDB().then(db => db.transaction(MEDIA_STORE, mode).objectStore(MEDIA_STORE));
+}
+function mediaPut(rec) { return mediaStore('readwrite').then(s => memReq(s.put(rec))); }
+function mediaGet(id) { return mediaStore('readonly').then(s => memReq(s.get(id))); }
+function mediaDelete(id) {
+  if (!id) return Promise.resolve();
+  return mediaStore('readwrite').then(s => memReq(s.delete(id)));
+}
+function mediaDeleteMany(ids) {
+  const list = (ids || []).filter(Boolean);
+  if (!list.length) return Promise.resolve();
+  return mediaStore('readwrite').then(s => Promise.all(list.map(id => memReq(s.delete(id)))));
 }
 
 async function memStore(mode) {
@@ -1396,12 +1524,12 @@ function localEmbed(text) {
   return vec.map(v => v / norm);
 }
 
-/** API 嵌入（OpenAI 兼容 /embeddings）。商汤 Token Plan 无此路由时抛错 → 回落本地 */
+/** API 嵌入（OpenAI 兼容 /embeddings）。模型名可在 settings.memory.embedModel 配置（默认商汤 embedding-1） */
 async function apiEmbed(text) {
   const res = await requestWithRotation(joinUrl(settings.baseUrl, '/embeddings'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'embedding-1', input: [String(text).slice(0, 2000)] })
+    body: JSON.stringify({ model: settings.memory.embedModel || 'embedding-1', input: [String(text).slice(0, 2000)] })
   });
   if (!res.ok) throw new Error('embeddings HTTP ' + res.status);
   const data = await res.json().catch(() => null);
@@ -1410,22 +1538,25 @@ async function apiEmbed(text) {
   return v;
 }
 
-/** 统一嵌入入口：首次探测网关能力并缓存结果（api / local） */
+const _embedModeByProvider = {};  // providerId → 'api' | 'local'：按供应商缓存探测结果（运行时，不持久化）
+
+/** 统一嵌入入口：按供应商探测网关 /embeddings 能力并缓存。
+ *  修复：旧实现探测失败会把全局 embeddingMode 持久化为 'local'，换回支持的供应商也不再探测；
+ *  现按供应商维度运行时缓存 —— 弹窗重开自动重新探测，换供应商各自独立判断。全链路限时。 */
 async function embedText(text) {
-  const mode = settings.memory.embeddingMode;
-  if (mode === 'api') {
-    try { return await apiEmbed(text); }
-    catch (_) { settings.memory.embeddingMode = 'local'; saveSettings(); }
-  } else if (mode !== 'local') {
+  const pid = settings.currentProviderId || 'default';
+  if (!_embedModeByProvider[pid]) {
+    let probed = null;
+    try { probed = await withTimeout(apiEmbed('ping'), MEM_PROBE_TIMEOUT_MS, null); }
+    catch (_) { /* 探测失败按本地 */ }
+    _embedModeByProvider[pid] = probed ? 'api' : 'local';
+  }
+  if (_embedModeByProvider[pid] === 'api') {
     try {
-      const v = await apiEmbed('ping');
-      settings.memory.embeddingMode = 'api';
-      saveSettings();
-      return v;
-    } catch (_) {
-      settings.memory.embeddingMode = 'local';
-      saveSettings();
-    }
+      const v = await withTimeout(apiEmbed(text), MEM_API_EMBED_TIMEOUT_MS, null);
+      if (v) return v;
+    } catch (_) { /* 本次 API 嵌入失败/超时 → 运行时回落本地，下次进弹窗重新探测 */ }
+    _embedModeByProvider[pid] = 'local';
   }
   return localEmbed(text);
 }
@@ -1513,7 +1644,10 @@ async function searchMemory(query, sess, k = settings.memory.topK || 6) {
   let q = query;
   if (settings.memory.rewriteEnabled && /它|他|她|这|那|上述|上面|前面|刚才/.test(query)) {
     try {
-      const rewritten = await chainChatComplete([{ role: 'user', content: buildRewritePrompt(query, sess) }]);
+      // 改写限时：超时用原句检索（不抛错，fallback null 走不到赋值分支）
+      const rewritten = await withTimeout(
+        chainChatComplete([{ role: 'user', content: buildRewritePrompt(query, sess) }]),
+        MEM_REWRITE_BUDGET_MS, null);
       const t = String(rewritten || '').trim();
       if (t && t.length <= 300) q = t;
     } catch (_) { /* 改写失败用原句检索 */ }
@@ -1570,11 +1704,12 @@ async function buildMemoryMessages(newPrompt, sess, onInfo) {
 
   const sections = [];
   let hits = [];
-  await maybeUpdateSummary(sess).catch(() => {}); // 顺带补做综述欠账（通常已最新）
+  // 限时补做综述欠账：模型链最坏 3 个 × 300s，不设预算可阻塞发送数分钟（超时跳过，下轮重试）
+  await withTimeout(maybeUpdateSummary(sess), MEM_SUMMARY_BUDGET_MS, null).catch(() => {});
   if (mem.summaryEnabled && sess.summary) sections.push('【对话主线综述】\n' + sess.summary);
 
   if (mem.retrievalEnabled && done.length) {
-    hits = await searchMemory(newPrompt, sess).catch(() => []);
+    hits = await withTimeout(searchMemory(newPrompt, sess), MEM_SEARCH_BUDGET_MS, []).catch(() => []);
     if (hits.length) {
       sections.push('【相关历史记录】\n' + hits.map(h =>
         `- [会话「${h.sessionTitle}」] ${h.text.slice(0, 160)}`
@@ -1614,7 +1749,7 @@ async function renderStorageStats() {
     ['消息', msgCount + ' 条'],
     ['本地图片', imgCount + ' 张'],
     ['向量记录', vc + ' 条'],
-    ['嵌入方式', settings.memory.embeddingMode === 'api' ? '网关 API' : '本地词法'],
+    ['嵌入方式', _embedModeByProvider[settings.currentProviderId] === 'api' ? '网关 API' : '本地词法'],
     ['存储占用', est ? `${fmt(est.usage)} / 配额 ${fmt(est.quota)}` : '（浏览器未提供）']
   ];
   box.innerHTML = rows.map(([k, v]) =>
@@ -1713,11 +1848,33 @@ async function streamChat(model, messages, { onDelta, onNotice, onReasoning, sig
 }
 
 /* ---------------- 绘图与图片本地转存 ---------------- */
-async function fetchImageAsBase64(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('抓取图片失败：HTTP ' + res.status);
-  const blob = await res.blob();
-  return await blobToBase64(blob);
+const MEDIA_DL_TIMEOUT_MS = 180000;      // 图片/视频下载上限 180s（挂起的下载不再无限等待）
+const VIDEO_POLL_FETCH_TIMEOUT_MS = 30000;  // 视频轮询单次 fetch 上限 30s（防单个挂起请求绕过 5min 总上限）
+
+/** 合并「用户 signal」与「超时」的中止信号（先到先中止；done() 清理定时器与监听）。
+ *  文本链路有三段超时保护，媒体下载/轮询此前无 signal —— 停止按钮中止不了大文件下载。 */
+function withTimeoutSignal(signal, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort);
+  }
+  return {
+    signal: ctrl.signal,
+    done() { clearTimeout(timer); if (signal) signal.removeEventListener('abort', onAbort); }
+  };
+}
+
+async function fetchImageAsBase64(url, signal) {
+  const lk = withTimeoutSignal(signal, MEDIA_DL_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: lk.signal });
+    if (!res.ok) throw new Error('抓取图片失败：HTTP ' + res.status);
+    const blob = await res.blob();
+    return await blobToBase64(blob);
+  } finally { lk.done(); }
 }
 
 async function doImageGeneration(prompt, signal, model = selectedModel, opts = {}) {
@@ -1770,15 +1927,15 @@ async function doImageGeneration(prompt, signal, model = selectedModel, opts = {
     const item = data?.data?.[0] || {};
 
     if (item.b64_json) {
-      // 接口直接返回 Base64
-      msg.content = 'data:image/png;base64,' + item.b64_json;
-      msg.cached = true;
+      // 接口直接返回 Base64 → 转存 IndexedDB（无远端 URL 可作兜底）
+      await attachMedia(msg, 'data:image/png;base64,' + item.b64_json, sid, '');
     } else if (item.url) {
-      // 抓取图片 URL → Blob → Base64，突破 1 小时有效期
+      // 抓取图片 URL → Blob → 转存 IndexedDB，突破 1 小时有效期
       try {
-        msg.content = await fetchImageAsBase64(item.url);
-        msg.cached = true;
-      } catch (_) {
+        const dataUrl = await fetchImageAsBase64(item.url, signal);
+        await attachMedia(msg, dataUrl, sid, item.url);
+      } catch (err) {
+        if (err.name === 'AbortError') throw err;  // 用户停止/超时：直接中止，不落 URL 兜底
         msg.content = item.url; // 兜底：保留原始链接并提示过期风险
         msg.cached = false;
       }
@@ -1791,7 +1948,7 @@ async function doImageGeneration(prompt, signal, model = selectedModel, opts = {
     if (isCur()) { const n = elOf(); if (n) n.replaceWith(buildMessageEl(msg)); }
     touchSession(sid);
   } catch (e) {
-    const i = msgs.indexOf(msg); if (i > -1) msgs.splice(i, 1);
+    const i = msgs.indexOf(msg); if (i > -1) { msgs.splice(i, 1); releaseMedia(msg); }
     await persistHistory();
     if (isCur()) { const n = elOf(); if (n) n.remove(); }
     if (e.name === 'AbortError') {
@@ -1804,18 +1961,18 @@ async function doImageGeneration(prompt, signal, model = selectedModel, opts = {
   if (isCur()) scrollToBottom();
 }
 
-/** 图片历史限额：最多 20 张且总量 ≤ 10MB，超出删除最旧 */
+/** 图片限额裁剪：会话级（只裁本会话的缓存图片；多会话累计可超全局限额，有 unlimitedStorage 兜底）。
+ *  缓存形态兼容 IndexedDB（mediaId，按真实 bytes 计）与旧内嵌 data URL（按长度估算）；裁掉的联动删 Blob */
 async function enforceImageLimitsAndSave(msgs = chatHistory) {
-  const isCachedImg = (m) => m.type === 'image' && isDataUrl(m.content);
-  const totalBytes = () => msgs.filter(isCachedImg).reduce((s, m) => s + m.content.length * 0.75, 0);
+  const isCachedImg = (m) => m.type === 'image' && hasLocalMedia(m);
   let imgs = msgs.filter(isCachedImg);
-  let total = totalBytes();
-  while ((imgs.length > MAX_IMAGE_COUNT || total > MAX_IMAGE_BYTES)) {
+  let total = () => imgs.reduce((s, m) => s + mediaBytes(m), 0);
+  while ((imgs.length > MAX_IMAGE_COUNT || total() > MAX_IMAGE_BYTES)) {
     const idx = msgs.findIndex(isCachedImg);
     if (idx === -1) break;
-    msgs.splice(idx, 1);
+    const [removed] = msgs.splice(idx, 1);
+    releaseMedia(removed);
     imgs = msgs.filter(isCachedImg);
-    total = totalBytes();
   }
   await persistHistory();
 }
@@ -1883,7 +2040,11 @@ async function doVideoGeneration(prompt, signal, model = selectedModel, opts = {
       await abortableSleep(pollIntervalMs(), signal);
       notice(`⏳ 视频生成中… 已等待 ${Math.floor((Date.now() - startTs) / 1000)}s`);
       try {
-        const pollRes = await fetch(pollUrl, { method: 'GET', headers: pollHeaders });
+        // 单次轮询 fetch 也限时：挂起的请求会绕过 5min 总上限（轮询不走 requestWithRotation）
+        const lk = withTimeoutSignal(signal, VIDEO_POLL_FETCH_TIMEOUT_MS);
+        let pollRes;
+        try { pollRes = await fetch(pollUrl, { method: 'GET', headers: pollHeaders, signal: lk.signal }); }
+        finally { lk.done(); }
         if (!pollRes.ok) continue;
         const pollData = await pollRes.json();
         const status = String(pollData?.status || pollData?.state || '').toLowerCase();
@@ -1900,7 +2061,10 @@ async function doVideoGeneration(prompt, signal, model = selectedModel, opts = {
         }
         // 其它状态（queued / processing / 未知）→ 继续轮询
       } catch (e) {
-        if (e.name === 'AbortError') throw e;
+        if (e.name === 'AbortError') {
+          if (signal?.aborted) throw e;   // 用户主动停止 → 整体中止
+          continue;                        // 仅单次轮询超时 → 继续下一轮
+        }
         if (e.videoFailed) throw e;           // 业务失败：直接上抛
         // 网络错误等 → 继续轮询
       }
@@ -1908,12 +2072,13 @@ async function doVideoGeneration(prompt, signal, model = selectedModel, opts = {
 
     if (!videoUrl) throw new Error('视频生成超时（5 分钟），任务可能仍在排队，可稍后重试');
 
-    // 3. 下载视频 → Base64 缓存
+    // 3. 下载视频 → 转存 IndexedDB 本地缓存
     notice('📥 正在下载视频并缓存到本地…');
     try {
-      msg.content = await fetchMediaAsBase64(videoUrl, 'video/mp4');
-      msg.cached = true;
-    } catch (_) {
+      const dataUrl = await fetchMediaAsBase64(videoUrl, 'video/mp4', signal);
+      await attachMedia(msg, dataUrl, sid, videoUrl);
+    } catch (err) {
+      if (err.name === 'AbortError') throw err;  // 用户停止/超时：直接中止，不落 URL 兜底
       msg.content = videoUrl;  // 兜底：保留原始链接
       msg.cached = false;
     }
@@ -1924,7 +2089,7 @@ async function doVideoGeneration(prompt, signal, model = selectedModel, opts = {
     touchSession(sid);
     toast('🎬 视频生成完成', 'success');
   } catch (e) {
-    const i = msgs.indexOf(msg); if (i > -1) msgs.splice(i, 1);
+    const i = msgs.indexOf(msg); if (i > -1) { msgs.splice(i, 1); releaseMedia(msg); }
     await persistHistory();
     if (isCur()) { const n = elOf(); if (n) n.remove(); }
     if (e.name === 'AbortError') {
@@ -1938,36 +2103,99 @@ async function doVideoGeneration(prompt, signal, model = selectedModel, opts = {
 }
 
 /** 视频历史限额：最多 10 段且总量 ≤ 300MB，超出删除最旧 */
+/** 视频限额裁剪：会话级，形态与清理逻辑同图片（IndexedDB mediaId / 旧内嵌 data URL 双兼容） */
 async function enforceVideoLimitsAndSave(msgs = chatHistory) {
-  const isCachedVideo = (m) => m.type === 'video' && isDataUrl(m.content);
-  const totalBytes = () => msgs.filter(isCachedVideo).reduce((s, m) => s + m.content.length * 0.75, 0);
+  const isCachedVideo = (m) => m.type === 'video' && hasLocalMedia(m);
   let vids = msgs.filter(isCachedVideo);
-  let total = totalBytes();
-  while ((vids.length > MAX_VIDEO_COUNT || total > MAX_VIDEO_BYTES)) {
+  let total = () => vids.reduce((s, m) => s + mediaBytes(m), 0);
+  while ((vids.length > MAX_VIDEO_COUNT || total() > MAX_VIDEO_BYTES)) {
     const idx = msgs.findIndex(isCachedVideo);
     if (idx === -1) break;
-    msgs.splice(idx, 1);
+    const [removed] = msgs.splice(idx, 1);
+    releaseMedia(removed);
     vids = msgs.filter(isCachedVideo);
-    total = totalBytes();
   }
   await persistHistory();
 }
 
 /** 下载媒体 URL → Base64（支持图片/视频） */
-async function fetchMediaAsBase64(url, expectedMime = 'image/png') {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  let blob = await res.blob();
-  // 服务器可能未返回正确的 Content-Type（如 octet-stream），兜底修正 MIME，保证 data URL 前缀可靠
-  if (!/^(image|video)\//.test(blob.type || '')) {
-    blob = new Blob([blob], { type: expectedMime });
+async function fetchMediaAsBase64(url, expectedMime = 'image/png', signal) {
+  const lk = withTimeoutSignal(signal, MEDIA_DL_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: lk.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    let blob = await res.blob();
+    // 服务器可能未返回正确的 Content-Type（如 octet-stream），兜底修正 MIME，保证 data URL 前缀可靠
+    if (!/^(image|video)\//.test(blob.type || '')) {
+      blob = new Blob([blob], { type: expectedMime });
+    }
+    return await new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = () => reject(new Error('媒体读取失败'));
+      fr.readAsDataURL(blob);
+    });
+  } finally { lk.done(); }
+}
+
+/* ---------- 媒体 IndexedDB 缓存（D1 方案 A：sessions 只存轻量引用，Blob 入 media 库） ---------- */
+const _mediaUrls = {};  // mediaId → objectURL（运行时缓存，重复渲染复用；弹窗关闭自动回收）
+
+/** data URL → Blob（fetch 支持 data: 协议，浏览器标准行为） */
+async function dataUrlToBlob(dataUrl) {
+  const res = await fetch(dataUrl);
+  return await res.blob();
+}
+
+/** 把已拿到的 data URL 媒体转存 IndexedDB：成功 → 消息只留轻量引用（mediaId/mime/bytes，
+ *  content 仅保留远端 URL 兜底，可能为空）；失败（如 IDB 不可用）→ 保留内嵌 data URL 旧模式，功能不受损 */
+async function attachMedia(msg, dataUrl, sessionId, fallbackUrl) {
+  try {
+    const blob = await dataUrlToBlob(dataUrl);
+    const rec = { id: 'media_' + uid(), sessionId: sessionId || '', mime: blob.type || '', bytes: blob.size, ts: Date.now(), blob };
+    await mediaPut(rec);
+    msg.mediaId = rec.id; msg.mime = rec.mime; msg.bytes = rec.bytes;
+    msg.content = fallbackUrl || '';
+  } catch (_) {
+    msg.content = dataUrl;   // 降级：内嵌 data URL（旧模式），渲染/下载路径同时兼容两种形态
   }
-  return new Promise((resolve, reject) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(fr.result);
-    fr.onerror = () => reject(new Error('媒体读取失败'));
-    fr.readAsDataURL(blob);
-  });
+  msg.cached = true;
+}
+
+/** 消息本地媒体的字节量：优先用转存时记录的真实 bytes，旧内嵌 data URL 按长度估算 */
+function mediaBytes(m) {
+  if (m.bytes != null) return m.bytes;
+  return isDataUrl(m.content) ? m.content.length * 0.75 : 0;
+}
+/** 消息是否已把媒体缓存到本地（IndexedDB 或内嵌 data URL） */
+function hasLocalMedia(m) { return !!m.mediaId || isDataUrl(m.content); }
+
+/** 取渲染用 URL：优先 IndexedDB Blob → objectURL（带缓存）；旧内嵌 data URL 直接可用；无本地媒体回落远端 URL */
+async function ensureMediaUrl(m) {
+  if (m.mediaId) {
+    if (_mediaUrls[m.mediaId]) return _mediaUrls[m.mediaId];
+    try {
+      const rec = await mediaGet(m.mediaId);
+      if (rec?.blob) {
+        const url = URL.createObjectURL(rec.blob);
+        _mediaUrls[m.mediaId] = url;
+        return url;
+      }
+      // Blob 丢失（如手动清过 IndexedDB）：返回远端兜底 URL（若可显示）
+      return /^(https?:|data:)/.test(m.content || '') ? m.content : '';
+    } catch (_) {
+      return /^(https?:|data:)/.test(m.content || '') ? m.content : '';
+    }
+  }
+  return m.content || '';
+}
+
+/** 清理某条消息的媒体缓存（删除消息/限额裁剪时调用） */
+function releaseMedia(m) {
+  if (m.mediaId) {
+    if (_mediaUrls[m.mediaId]) { try { URL.revokeObjectURL(_mediaUrls[m.mediaId]); } catch (_) {} delete _mediaUrls[m.mediaId]; }
+    mediaDelete(m.mediaId).catch(() => {});
+  }
 }
 
 /* ---------------- 发送总入口 ---------------- */
@@ -1980,7 +2208,9 @@ async function handleSend() {
   const rawText = inputEl.value.trim();
   if (!rawText) return;
 
-  if (!settings.keys.length) {
+  // 非「⚡ 自动」才要求当前供应商有 Key；自动模式支持跨供应商找有 Key 的
+  // 供应商（capabilityCandidates 已过滤无 Key 者，全无 Key 时 resolveRoute 下方有提示）
+  if (selectedModel !== AUTO_MODEL_ID && !settings.keys.length) {
     toast('请先在设置中配置 API Key', 'error');
     openSettings();
     return;
@@ -2065,7 +2295,11 @@ async function handleSend() {
     }
   } catch (e) {
     // 仅自动路由的跨供应商全失败会走到这里（单个供应商内部的失败已在各自函数里落气泡）
-    if (e && e.name !== 'AbortError') pushError('生成失败：' + e.message, e.needSettings);
+    if (e && e.name !== 'AbortError') {
+      // 错误落点锁定发起时的会话（sid）：长任务期间用户切走聊天，错误不能写进别人会话
+      const tSess = sessions.find(s => s.id === sid);
+      pushError('生成失败：' + e.message, e.needSettings, tSess ? tSess.messages : chatHistory, sid);
+    }
   } finally {
     generating.delete(sid);
     setSendState();
@@ -2176,7 +2410,8 @@ async function doChat(prompt, signal, model = selectedModel, opts = {}) {
     touchSession(sid);
     // 后台记忆维护：问答对入向量库 + 综述补账（不阻塞界面，失败下次自动重试）
     memoryIndexReply(sess, prompt, full).catch(() => {});
-    maybeUpdateSummary(sess).catch(() => {});
+    // 后台综述同样限时：模型链最坏 3 × 300s，白占免费额度与连接，且停止按钮中止不掉
+    withTimeout(maybeUpdateSummary(sess), MEM_SUMMARY_BUDGET_MS, null).catch(() => {});
   } catch (e) {
     if (e.name === 'AbortError') {
       // 用户主动停止：已有部分内容则保留，否则移除气泡
@@ -2235,7 +2470,7 @@ function toggleEmpty() {
   $('#emptyState').classList.toggle('hidden', chatHistory.length > 0);
 }
 
-/* 视频懒加载：滚动进入视口附近才真正挂载 Base64，避免弹窗每次打开都解码整段大视频 */
+/* 视频懒加载：滚动进入视口附近才真正挂载媒体，避免弹窗每次打开都解码整段大视频 */
 let videoLazyObserver = null;
 function observeVideoLazy(vEl) {
   if (!vEl) return;
@@ -2245,6 +2480,7 @@ function observeVideoLazy(vEl) {
         if (en.isIntersecting) {
           const v = en.target;
           v.preload = 'metadata';
+          v.dataset.lazyLoaded = '1';
           v.src = v.dataset.src || v.src;
           videoLazyObserver.unobserve(v);
         }
@@ -2252,7 +2488,22 @@ function observeVideoLazy(vEl) {
     }, { root: $('#chatScroll'), rootMargin: '400px 0px' });
   }
   if (videoLazyObserver) videoLazyObserver.observe(vEl);
-  else vEl.src = vEl.dataset.src || '';
+  else { vEl.dataset.lazyLoaded = '1'; vEl.src = vEl.dataset.src || ''; }
+}
+
+/** 异步挂载本地媒体：IndexedDB Blob → objectURL（<img> 用；<video> 走下方懒加载版） */
+async function hydrateMediaImg(el, m) {
+  if (!el) return;
+  const url = await ensureMediaUrl(m);
+  if (url) el.src = url;
+}
+/** 懒加载版：写入 data-src；若视口回调已触发过（lazyLoaded 标记），直接挂载 */
+async function hydrateMediaVideo(el, m) {
+  if (!el) return;
+  const url = await ensureMediaUrl(m);
+  if (!url) return;
+  el.dataset.src = url;
+  if (el.dataset.lazyLoaded) el.src = url;
 }
 
 function buildMessageEl(m) {
@@ -2277,7 +2528,7 @@ function buildMessageEl(m) {
       : '<span class="chip chip-warn">⚠ 原始链接约 1 小时后过期，请尽快保存</span>';
     wrap.innerHTML = `
       <div class="bubble image-bubble">
-        <img class="gen-img" src="${escapeHtml(m.content)}" alt="生成图片" data-id="${m.id}" title="点击查看大图">
+        <img class="gen-img" alt="生成图片" data-id="${m.id}" title="点击查看大图">
         <div class="img-chips">${badge}</div>
         <div class="img-actions">
           <button class="mini-btn" data-act="zoom" data-id="${m.id}">🔍 放大</button>
@@ -2286,6 +2537,7 @@ function buildMessageEl(m) {
         </div>
         <div class="msg-meta">${time} · ${escapeHtml(m.model || '')}</div>
       </div>`;
+    hydrateMediaImg(wrap.querySelector('img.gen-img'), m);  // IndexedDB Blob → objectURL 异步挂载
     return wrap;
   }
 
@@ -2300,7 +2552,7 @@ function buildMessageEl(m) {
       : '<span class="chip chip-warn">⚠ 原始链接可能过期，请尽快保存</span>';
     wrap.innerHTML = `
       <div class="bubble video-bubble">
-        <video class="gen-video" controls preload="none" data-src="${escapeHtml(m.content)}" data-id="${m.id}"></video>
+        <video class="gen-video" controls preload="none" data-id="${m.id}"></video>
         <div class="img-chips">${badge}</div>
         <div class="img-actions">
           <button class="mini-btn" data-act="download" data-id="${m.id}">⬇ 下载视频</button>
@@ -2308,6 +2560,7 @@ function buildMessageEl(m) {
         <div class="msg-meta">${time} · ${escapeHtml(m.model || '')}</div>
       </div>`;
     observeVideoLazy(wrap.querySelector('video.gen-video'));
+    hydrateMediaVideo(wrap.querySelector('video.gen-video'), m);  // Blob → data-src（懒加载就绪）
     return wrap;
   }
 
@@ -2357,7 +2610,14 @@ function findMsg(id) { return chatHistory.find(m => m.id === id); }
 
 function openLightbox(msg) {
   lbCurrent = msg;
-  $('#lightboxImg').src = msg.content;
+  const img = $('#lightboxImg');
+  // 旧内嵌 data URL 直接显示；IndexedDB 形态先取 Blob URL（失败回落远端 URL）
+  if (msg.mediaId) {
+    img.src = '';
+    ensureMediaUrl(msg).then(u => { if (lbCurrent === msg && u) img.src = u; });
+  } else {
+    img.src = msg.content;
+  }
   $('#lbPrompt').textContent = msg.prompt ? 'prompt：' + msg.prompt : '';
   $('#lightbox').classList.remove('hidden');
 }
@@ -2367,7 +2627,12 @@ function closeLightbox() {
   lbCurrent = null;
 }
 
-async function toDataUrl(content) {
+async function toDataUrl(msg) {
+  if (msg.mediaId) {
+    const rec = await mediaGet(msg.mediaId).catch(() => null);
+    if (rec?.blob) return await blobToBase64(rec.blob);   // IndexedDB Blob → data URL
+  }
+  const content = String(msg.content || '');
   if (isDataUrl(content)) return content;
   return await fetchImageAsBase64(content); // 未缓存成功的旧链接（可能已过期）
 }
@@ -2386,7 +2651,7 @@ async function dataUrlToPngBlob(dataUrl) {
 
 async function copyImage(msg) {
   try {
-    const dataUrl = await toDataUrl(msg.content);
+    const dataUrl = await toDataUrl(msg);
     const blob = await dataUrlToPngBlob(dataUrl);
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
     toast('图片已复制到剪贴板', 'success');
@@ -2395,19 +2660,24 @@ async function copyImage(msg) {
   }
 }
 
-function downloadImage(msg) {
+async function downloadImage(msg) {
   if (!msg) return;
-  const content = String(msg.content);
   let ext = 'png';
-  const imgMatch = content.match(/^data:image\/(\w+)/);
-  const vidMatch = content.match(/^data:video\/([\w]+)/);
-  if (imgMatch) {
-    ext = imgMatch[1] === 'jpeg' ? 'jpg' : imgMatch[1];
-  } else if (vidMatch) {
-    ext = vidMatch[1] === 'quicktime' ? 'mov' : vidMatch[1];
+  // 扩展名：优先用转存时记录的真实 MIME；旧内嵌 data URL 从前缀解析；远端 URL 兜底 png
+  const content = String(msg.content || '');
+  const dm = content.match(/^data:([^;,]+)/);
+  const mm = String(msg.mime || dm?.[1] || '').match(/(image|video)\/(\w+)/);
+  if (mm) ext = mm[2] === 'jpeg' ? 'jpg' : mm[2] === 'quicktime' ? 'mov' : mm[2];
+  // IndexedDB 形态：用 Blob 的 objectURL 下载（chrome.downloads 支持 blob: 协议）
+  let url = content;
+  if (msg.mediaId) {
+    url = await ensureMediaUrl(msg);
+    if (!url) { toast('本地媒体缺失且原始链接不可用，无法下载', 'error'); return; }
+  } else if (!/^(https?:|data:)/.test(url)) {
+    toast('没有可下载的媒体内容', 'error'); return;
   }
   chrome.downloads.download(
-    { url: content, filename: `sensenova-${formatFileTs(msg.ts || Date.now())}.${ext}` },
+    { url, filename: `sensenova-${formatFileTs(msg.ts || Date.now())}.${ext}` },
     (downloadId) => {
       if (downloadId === undefined) {
         toast('下载失败：' + (chrome.runtime.lastError?.message || '未知错误'), 'error');
@@ -2615,6 +2885,9 @@ function renderProviderSelect() {
 function switchProvider(id, opts = {}) {
   const p = (settings.providers || []).find(x => x.id === id);
   if (!p) return;
+  // 先把顶层未落盘的改动写回原供应商，再投影新供应商（与 runUnderProvider 同一纪律，
+  // 否则切换前未保存的编辑会随投影被覆盖丢失）
+  if (p.id !== settings.currentProviderId) absorbProvider();
   projectProvider(p);
   saveSettings();
   renderProviderSelect();
@@ -2667,7 +2940,9 @@ function startRename(pid) {
   input.className = 'pv-rename-input';
   input.value = old;
   input.maxLength = 30;
+  let done = false;   // Enter 提交后 input 脱离 DOM 触发 blur，防止 commit 执行两次（双 toast）
   const commit = () => {
+    if (done) return; done = true;
     const name = input.value.trim().slice(0, 30);
     if (!name) { input.remove(); item.textContent = old; return; }
     p.name = name;
@@ -2680,7 +2955,7 @@ function startRename(pid) {
   input.select();
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') commit();
-    else if (e.key === 'Escape') { input.remove(); }
+    else if (e.key === 'Escape') { if (!done) { done = true; input.remove(); } }
   });
   input.addEventListener('blur', commit);
 }
@@ -3114,8 +3389,12 @@ function bindEvents() {
     }
     const item = e.target.closest('.model-item');
     if (item) {
-      // 视频/不支持模型不可选（muted）
-      if (item.classList.contains('muted')) { toast('该模型暂不支持生成，请选择文本或绘图模型', 'error'); return; }
+      // 视频模型在「视频生成能力」未开启时置灰（muted）：引导去设置开启，而不是死文案
+      if (item.classList.contains('muted')) {
+        toast('视频生成未启用：已在设置中为你定位「视频生成能力」开关，勾选后即可选择', 'error');
+        openSettings();
+        return;
+      }
       selectedModel = item.dataset.id;
       settings.lastModel = selectedModel;
       syncSessionModel();          // 模型选择记住到当前聊天
@@ -3248,7 +3527,15 @@ async function init() {
       for (const s of sessions) await backfillSessionVectors(s).catch(() => {});
     }
   }).catch(() => {});
-  maybeUpdateSummary(curSession()).catch(() => {});
+  withTimeout(maybeUpdateSummary(curSession()), MEM_SUMMARY_BUDGET_MS, null).catch(() => {});
+
+  // 媒体迁移（后台）：旧内嵌 data URL → IndexedDB media 库；完成后落盘瘦身并重渲染当前会话。
+  // 未迁移的会话按旧模式照常渲染（双形态兼容），迁移失败不丢数据。
+  migrateInlineMedia().then(changed => {
+    if (!changed) return;
+    persistHistory();
+    if (curSession()?.messages.some(m => m.mediaId)) renderAllMessages();
+  }).catch(() => {});
 
   // 已配置 Key 且无模型缓存时，自动拉取模型列表
   if (!cachedModels.length && settings.keys.length) fetchModels(true);

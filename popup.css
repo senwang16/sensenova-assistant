@@ -991,7 +991,7 @@ html.fullscreen #sidebar { width: 232px; }
 .pv-op:hover { background: var(--hover); color: var(--text); }
 .pv-op.pv-del:hover { color: var(--danger); background: var(--danger-soft); }
 .pv-empty { font-size: 12px; color: var(--text-dim); padding: 8px 4px; }
-.pv-rename-input {
+.pv-rename-input, .ss-rename-input {
   flex: 1; min-width: 0; font-size: 12.5px; padding: 4px 6px;
   border: 1px solid var(--accent); border-radius: 6px; background: var(--panel); color: var(--text);
 }

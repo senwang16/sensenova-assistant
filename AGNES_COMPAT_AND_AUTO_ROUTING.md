@@ -184,6 +184,7 @@ const minGap = Math.ceil(60000 / rpm);   // 10rpm→6s；1rpm→60s
 ### 5.3 与限流的交互
 
 - 目标是 video 且 1 RPM 冷却中 → 沿用「还需 Ns」提示并中止（不静默降级，避免用户以为要图却出图）。
+  - ⚠️ 冷却以**发起时间**为准：任务失败同样占用 60s 冷却（保守策略——失败尝试也消耗过一次调度额度）。
   - 该冷却读的是**实际执行该视频任务的供应商**的 `lastVideoTs`，由 `videoTargetProvider(autoRoute)` 解析：自动路由取 `candidates[0].providerId`，非自动取当前供应商。
   - 之所以不能直接读顶层 `settings.lastVideoTs`：它是「当前供应商」的活动投影，当前在商汤、视频交给 Agnes 时会读到商汤的时间戳（恒为 0），导致冷却漏拦。
   - 同理，视频开关守卫（`videoEnabled`）也按目标供应商判定，否则「商汤未开视频」会把本应转交 Agnes 的请求误拦。
